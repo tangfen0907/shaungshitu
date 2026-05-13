@@ -31,7 +31,7 @@ LOCAL_CONFIG_OVERRIDES = {
     "dual_score_weight_cv": 1.0,
     "dual_view_center_weight": 1.0,
     "dual_view_recon_weight": 0.5,
-    "stage2_method": "paired_proto",
+    "stage2_method": "separate_proto",
     "state_dim": 64,
     "num_prototypes": 5,
     "proto_temperature": 0.2,

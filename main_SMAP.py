@@ -32,7 +32,7 @@ LOCAL_CONFIG_OVERRIDES = {
     "lambda_cv_stage0": 0.0,
     "lambda_cv_stage1": 0.05,
     "lambda_cv_stage2": 0.0,
-    "stage2_method": "consensus_proto_v2",
+    "stage2_method": "separate_proto",
     "state_dim": 64,
     "num_prototypes": 10,
     # Softer than the original 0.2 setting, but not as flat as 1.0.

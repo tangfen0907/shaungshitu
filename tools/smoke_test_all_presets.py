@@ -30,7 +30,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from data_loader.data_loader import get_loader_segment
+from data_factory.data_loader import get_loader_segment
 from model.axis_view_encoder import PatchRelationDualEncoder
 from model.main_net import AnomalyDetector
 from utils.config import Config, build_dataset_config
@@ -95,7 +95,7 @@ def _load_genesis_v1_ablation_case() -> PresetCase:
     overrides.update(
         {
             "active_view": "v1",
-            "stage2_method": "consensus_proto",
+            "stage2_method": "separate_proto",
             "lambda_cv_stage0": 0.0,
             "lambda_cv_stage1": 0.0,
             "lambda_cv_stage2": 0.0,
@@ -239,7 +239,7 @@ def _make_model(config: Config) -> AnomalyDetector:
         state_dim=int(getattr(config, "state_dim", 0)),
         num_prototypes=int(getattr(config, "num_prototypes", 0) or 1),
         proto_temperature=float(getattr(config, "proto_temperature", 0.2)),
-        stage2_method=str(getattr(config, "stage2_method", "consensus_proto")),
+        stage2_method=str(getattr(config, "stage2_method", "separate_proto")),
         readout_mode=str(getattr(config, "readout_mode", "attn_topk_max")),
         topk_ratio=float(getattr(config, "topk_ratio", 0.1)),
         topk_k=int(getattr(config, "topk_k", 0)),

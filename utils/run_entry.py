@@ -265,7 +265,7 @@ def print_train_summary(config: Config, run_dir: str, run_name: str, experiment_
     )
     print(
         "Stage2: "
-        f"method={getattr(config, 'stage2_method', 'consensus_proto')} | "
+        f"method={getattr(config, 'stage2_method', 'separate_proto')} | "
         f"rounds={config.num_stage2_rounds if config.num_stage2_rounds > 0 else 'auto'} | "
         f"epochs_per_round={config.epochs_per_stage2_round if config.epochs_per_stage2_round > 0 else 'auto'} | "
         "refresh_unit=epoch | "
@@ -328,7 +328,7 @@ def print_eval_summary(
     )
     print(
         "Evaluation: "
-        f"method={getattr(config, 'stage2_method', 'consensus_proto')} | "
+        f"method={getattr(config, 'stage2_method', 'separate_proto')} | "
         f"num_prototypes={getattr(config, 'num_prototypes', 0)} | "
         f"threshold_q={config.decision_quantile} | "
         f"js={getattr(config, 'lambda_js_score', 1.0)} | "

@@ -93,11 +93,7 @@ def run_train_loop(solver):
         f"max_core_frac={float(getattr(self.config, 'stage2_balanced_core_max_fraction', 1.0)):.3f}) | "
         f"core_label_diag={bool(getattr(self.config, 'enable_joint_core_label_diagnostics', False))}"
     )
-    title = "Dual-View Consensus Prototype Learning"
-    if self._stage2_method() == "consensus_proto_v2":
-        title = "Dual-View Consensus Prototype Learning V2"
-    elif self._stage2_method() == "paired_proto":
-        title = "Dual-View Paired Prototype Learning"
+    title = "Dual-View Separate Prototype Learning"
     print(f"========== Stage 2 {title} ==========")
     self._run_stage2_consensus_proto_refinement(
         num_stage2_rounds=num_stage2_rounds,

@@ -1,165 +1,21 @@
-from typing import Optional, Union
+from typing import Union
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from model.axis_view_encoder import PatchRelationDualEncoder
+from model.prototype_head import DualViewPrototypeHeads, PrototypeHead
 from model.reconstructor import Reconstructor
+from model.svdd_head import MultiCenterSVDD
 from model.tcn_encoder import TCNEncoder
 
 
-class MultiCenterSVDD(nn.Module):
-    """
-    多中心 SVDD 模块。
-
-    注意：
-    1. 簇中心和全局中心均使用 register_buffer 保存
-    2. 这样它们不会被 Adam 直接更新
-    3. 第二阶段通过 update_centers 手动覆写
-    """
-
-    def __init__(self, latent_dim: int):
-        super().__init__()
-        self.latent_dim = latent_dim
-        self.register_buffer("global_c", torch.zeros(latent_dim))
-        self.register_buffer("cluster_centers", torch.zeros(1, latent_dim))
-        self.register_buffer("cluster_priors", torch.ones(1))
-
-    def update_centers(
-        self,
-        new_centers: Union[np.ndarray, torch.Tensor],
-        features: Optional[Union[np.ndarray, torch.Tensor]] = None,
-    ):
-        """
-        用聚类结果手动更新多簇中心与全局中心。
-        """
-        if isinstance(new_centers, np.ndarray):
-            centers = torch.from_numpy(new_centers).float()
-        elif isinstance(new_centers, torch.Tensor):
-            centers = new_centers.detach().float().cpu()
-        else:
-            raise TypeError("new_centers 必须是 numpy.ndarray 或 torch.Tensor。")
-
-        if centers.dim() != 2 or centers.size(-1) != self.latent_dim:
-            raise ValueError(
-                f"new_centers 应为 [m, {self.latent_dim}]，实际得到 {tuple(centers.shape)}"
-            )
-
-        if centers.size(0) == 0:
-            raise ValueError("至少需要一个聚类中心才能更新 SVDD。")
-
-        priors = torch.ones(centers.size(0), dtype=torch.float32) / centers.size(0)
-
-        if features is None:
-            global_center = centers.mean(dim=0)
-        elif isinstance(features, np.ndarray):
-            feature_tensor = torch.from_numpy(features).float()
-            global_center = feature_tensor.mean(dim=0)
-        elif isinstance(features, torch.Tensor):
-            global_center = features.detach().float().cpu().mean(dim=0)
-        else:
-            raise TypeError("features must be None, numpy.ndarray, or torch.Tensor.")
-
-        self.cluster_centers = centers.to(self.global_c.device)
-        self.cluster_priors = priors.to(self.global_c.device)
-        self.global_c = global_center.to(self.global_c.device)
-
-    @torch.no_grad()
-    def ema_update_cluster_centers(
-        self,
-        cluster_ids: torch.Tensor,
-        batch_cluster_means: torch.Tensor,
-        momentum: float,
-    ):
-        """Use batch reliable-cluster means to update the stored classifier centers."""
-        if batch_cluster_means.numel() == 0:
-            return
-
-        momentum = min(max(float(momentum), 0.0), 1.0)
-        cluster_ids = cluster_ids.detach().long().to(self.cluster_centers.device)
-        batch_cluster_means = batch_cluster_means.detach().to(self.cluster_centers.device)
-
-        updated = self.cluster_centers.clone()
-        updated[cluster_ids] = (
-            momentum * updated[cluster_ids]
-            + (1.0 - momentum) * batch_cluster_means
-        )
-        self.cluster_centers = updated
-
-    @torch.no_grad()
-    def ema_update_global_center(self, batch_features: torch.Tensor, momentum: float):
-        """Update the global classifier center using current reliable batch features."""
-        if batch_features.numel() == 0:
-            return
-
-        momentum = min(max(float(momentum), 0.0), 1.0)
-        batch_mean = batch_features.detach().to(self.global_c.device).mean(dim=0)
-        self.global_c = momentum * self.global_c + (1.0 - momentum) * batch_mean
-
-    def compute_gravity(self, z: torch.Tensor, tau: float) -> torch.Tensor:
-        """
-        计算局部簇引力分数：
-            -log sum_j pi_j * exp(-||z-c_j||^2 / tau)
-        """
-        tau = max(float(tau), 1e-6)
-        distances = torch.cdist(z, self.cluster_centers, p=2.0) ** 2
-        log_prior = torch.log(self.cluster_priors.clamp_min(1e-12)).unsqueeze(0)
-        weighted_logits = -distances / tau + log_prior
-        gravity = -torch.logsumexp(weighted_logits, dim=1)
-        return gravity
-
-
-class ConsensusPrototypeHead(nn.Module):
-    """Shared learnable prototypes for normal operating states."""
-
-    def __init__(self, num_prototypes: int, state_dim: int, temperature: float = 0.2):
-        super().__init__()
-        self.num_prototypes = int(max(1, num_prototypes))
-        self.state_dim = int(state_dim)
-        self.temperature = float(max(temperature, 1e-6))
-        self.prototypes = nn.Parameter(torch.empty(self.num_prototypes, self.state_dim))
-        nn.init.normal_(self.prototypes, mean=0.0, std=0.02)
-
-    @torch.no_grad()
-    def init_from_centers(self, centers: Union[np.ndarray, torch.Tensor]):
-        if isinstance(centers, np.ndarray):
-            centers = torch.from_numpy(centers).float()
-        elif isinstance(centers, torch.Tensor):
-            centers = centers.detach().float().cpu()
-        else:
-            raise TypeError("centers must be a numpy array or torch tensor.")
-        if centers.dim() != 2 or centers.size(0) != self.num_prototypes or centers.size(1) != self.state_dim:
-            raise ValueError(
-                f"Prototype centers should be [{self.num_prototypes}, {self.state_dim}], "
-                f"got {tuple(centers.shape)}."
-            )
-        self.prototypes.copy_(centers.to(device=self.prototypes.device, dtype=self.prototypes.dtype))
-
-    def distances(self, u: torch.Tensor) -> torch.Tensor:
-        return torch.cdist(u, self.prototypes, p=2.0) ** 2
-
-    def forward(self, u: torch.Tensor) -> dict:
-        dist_sq = self.distances(u)
-        logits = -dist_sq / max(float(self.temperature), 1e-6)
-        q = F.softmax(logits, dim=1)
-        conf, pred = torch.max(q, dim=1)
-        min_dist_sq = torch.gather(dist_sq, 1, pred.view(-1, 1)).squeeze(1)
-        min_dist = torch.sqrt(min_dist_sq.clamp_min(0.0) + 1e-12)
-        return {
-            "dist_sq": dist_sq,
-            "q": q,
-            "pred": pred,
-            "conf": conf,
-            "min_dist": min_dist,
-        }
-
-
 class AnomalyDetector(nn.Module):
-    """
-    顶层异常检测网络：
-    Encoder + Reconstructor + MultiCenterSVDD
+    """Top-level anomaly detector.
+
+    Dual-view mode uses independent View1/View2 prototype heads. The
+    compatibility global z remains for the existing training/evaluation flow.
     """
 
     def __init__(
@@ -179,7 +35,7 @@ class AnomalyDetector(nn.Module):
         state_dim: int = 0,
         num_prototypes: int = 1,
         proto_temperature: float = 0.2,
-        stage2_method: str = "consensus_proto",
+        stage2_method: str = "separate_proto",
         readout_mode: str = "attn_topk_max",
         topk_ratio: float = 0.1,
         topk_k: int = 0,
@@ -207,11 +63,8 @@ class AnomalyDetector(nn.Module):
                 f"got state_dim={self.state_dim}, latent_dim={int(latent_dim)}."
             )
         self.num_prototypes = int(max(1, num_prototypes))
-        self.prototype_mode = (
-            "paired"
-            if str(stage2_method or "").strip().lower() in {"paired_proto", "paired", "paired_prototype"}
-            else "shared"
-        )
+        self.stage2_method = str(stage2_method or "separate_proto").strip().lower()
+        self.prototype_mode = "separate" if self.is_dual_view else "single"
 
         if self.is_dual_view:
             self.encoder_in_channels = self.raw_in_channels
@@ -280,18 +133,20 @@ class AnomalyDetector(nn.Module):
         else:
             raise ValueError(f"Unsupported active_view: {active_view}")
         self.svdd = MultiCenterSVDD(latent_dim=latent_dim)
-        self.prototype_head = ConsensusPrototypeHead(
-            num_prototypes=self.num_prototypes,
-            state_dim=self.state_dim,
-            temperature=proto_temperature,
-        )
         if self.is_dual_view:
-            self.prototype_head_v1 = ConsensusPrototypeHead(
+            self.prototype_heads = DualViewPrototypeHeads(
                 num_prototypes=self.num_prototypes,
                 state_dim=self.state_dim,
                 temperature=proto_temperature,
             )
-            self.prototype_head_v2 = ConsensusPrototypeHead(
+            self.prototype_head_v1 = self.prototype_heads.prototype_head_v1
+            self.prototype_head_v2 = self.prototype_heads.prototype_head_v2
+            # Compatibility alias for old utilities that expect
+            # model.prototype_head to exist. In dual-view mode this points to
+            # View1 only and must not be used for View2 assignment.
+            self.prototype_head = self.prototype_head_v1
+        else:
+            self.prototype_head = PrototypeHead(
                 num_prototypes=self.num_prototypes,
                 state_dim=self.state_dim,
                 temperature=proto_temperature,
@@ -489,7 +344,24 @@ class AnomalyDetector(nn.Module):
 
     @torch.no_grad()
     def init_prototypes_from_centers(self, centers: Union[np.ndarray, torch.Tensor]):
+        if self.is_dual_view:
+            # Deprecated compatibility path: initialize two independent
+            # prototype tables from the same centers without sharing params.
+            self.prototype_head_v1.init_from_centers(centers)
+            self.prototype_head_v2.init_from_centers(centers)
+            return
         self.prototype_head.init_from_centers(centers)
+
+    @torch.no_grad()
+    def init_separate_prototypes_from_centers(
+        self,
+        centers_v1: Union[np.ndarray, torch.Tensor],
+        centers_v2: Union[np.ndarray, torch.Tensor],
+    ):
+        if not self.is_dual_view:
+            raise RuntimeError("Separate dual-view prototypes require dual-view mode.")
+        self.prototype_head_v1.init_from_centers(centers_v1)
+        self.prototype_head_v2.init_from_centers(centers_v2)
 
     @torch.no_grad()
     def init_paired_prototypes_from_centers(
@@ -497,10 +369,9 @@ class AnomalyDetector(nn.Module):
         centers_v1: Union[np.ndarray, torch.Tensor],
         centers_v2: Union[np.ndarray, torch.Tensor],
     ):
-        if not self.is_dual_view:
-            raise RuntimeError("Paired prototypes require dual-view mode.")
-        self.prototype_head_v1.init_from_centers(centers_v1)
-        self.prototype_head_v2.init_from_centers(centers_v2)
+        # Backward-compatible name. The active design is separate prototypes,
+        # not a shared/common prototype table.
+        self.init_separate_prototypes_from_centers(centers_v1, centers_v2)
 
     def encode(self, x: torch.Tensor, view: str = None) -> torch.Tensor:
         if self.is_dual_view:
@@ -538,8 +409,7 @@ class AnomalyDetector(nn.Module):
 
     def forward(self, x: torch.Tensor, stage: str = "stage1"):
         """
-        不同阶段统一返回字典，避免上层训练逻辑分支过多。
-        """
+        涓嶅悓闃舵缁熶竴杩斿洖瀛楀吀锛岄伩鍏嶄笂灞傝缁冮€昏緫鍒嗘敮杩囧銆?        """
         if self.is_dual_view:
             dual_features = self.dual_encoder(x)
             z1 = dual_features["z1_global"]
@@ -573,15 +443,11 @@ class AnomalyDetector(nn.Module):
                 }
             )
 
-        if stage in {"stage2", "test", "consensus_proto"}:
+        if stage in {"stage2", "test", "separate_proto", "consensus_proto"}:
             if self.is_dual_view:
                 u1, u2 = self.state_from_views(z1, z2)
-                if self.prototype_mode == "paired":
-                    proto1 = self.prototype_head_v1(u1)
-                    proto2 = self.prototype_head_v2(u2)
-                else:
-                    proto1 = self.prototype_head(u1)
-                    proto2 = self.prototype_head(u2)
+                proto1 = self.prototype_head_v1(u1)
+                proto2 = self.prototype_head_v2(u2)
                 outputs.update(
                     {
                         "u1": u1,

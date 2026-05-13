@@ -45,7 +45,8 @@ class Config:
     dual_score_weight_cv: float = 1.0
     dual_view_center_weight: float = 1.0
     dual_view_recon_weight: float = 0.5
-    stage2_method: str = "consensus_proto"
+    stage2_method: str = "separate_proto"
+    prototype_mode: str = "separate"
     state_dim: int = 0
     num_prototypes: int = 0
     proto_temperature: float = 0.2
@@ -175,7 +176,8 @@ _COMMON_EXPLICIT: Dict[str, object] = {
     "weight_decay": 1e-5,
     "num_stage2_rounds": 4,
     "epochs_per_stage2_round": 5,
-    "stage2_method": "consensus_proto",
+    "stage2_method": "separate_proto",
+    "prototype_mode": "separate",
     "state_dim": 0,
     "num_prototypes": 0,
     "proto_temperature": 0.2,
@@ -403,7 +405,7 @@ _DATASET_META: Dict[str, Dict[str, object]] = {
 
 
 _STAGE2_METHOD_DEFAULTS: Dict[str, Dict[str, object]] = {
-    "consensus_proto_v2": {
+    "separate_proto": {
         "lambda_state_consistency": 0.05,
         "lambda_proto_pull": 0.2,
         "q_cons_sharpen_temperature": 1.0,
@@ -412,30 +414,30 @@ _STAGE2_METHOD_DEFAULTS: Dict[str, Dict[str, object]] = {
         "stage2_balanced_core_max_fraction": 0.35,
         "stage2_balanced_core_min_per_proto": 16,
     },
-    "paired_proto": {
-        "lambda_state_consistency": 1.0,
-        "lambda_proto_pull": 0.2,
-        "q_cons_sharpen_temperature": 1.0,
-        "lambda_proto_usage_balance": 0.05,
-        "lambda_proto_relation_consistency": 0.05,
-        "stage2_balanced_core": True,
-        "stage2_balanced_core_max_fraction": 0.50,
-        "stage2_balanced_core_min_per_proto": 16,
-    },
 }
 
 
 def _normalize_stage2_method(method: object) -> str:
-    normalized = str(method or "consensus_proto").strip().lower()
+    normalized = str(method or "separate_proto").strip().lower()
     aliases = {
-        "prototype": "consensus_proto",
-        "consensus": "consensus_proto",
-        "consensus_proto_balanced": "consensus_proto_v2",
-        "balanced_consensus_proto": "consensus_proto_v2",
-        "paired": "paired_proto",
-        "paired_prototype": "paired_proto",
+        "prototype": "separate_proto",
+        "consensus": "separate_proto",
+        "consensus_proto": "separate_proto",
+        "consensus_proto_v2": "separate_proto",
+        "consensus_proto_balanced": "separate_proto",
+        "balanced_consensus_proto": "separate_proto",
+        "paired": "separate_proto",
+        "paired_proto": "separate_proto",
+        "paired_prototype": "separate_proto",
+        "separate": "separate_proto",
+        "separate_prototype": "separate_proto",
     }
-    return aliases.get(normalized, normalized)
+    normalized = aliases.get(normalized, normalized)
+    if normalized in {"shared_proto", "shared_prototype", "common_proto", "common_prototype"}:
+        raise ValueError("Shared/common prototype mode has been removed. Use 'separate_proto'.")
+    if normalized != "separate_proto":
+        raise ValueError("stage2_method should be 'separate_proto'.")
+    return normalized
 
 
 def apply_stage2_method_defaults(
@@ -444,8 +446,9 @@ def apply_stage2_method_defaults(
 ) -> Dict[str, object]:
     """Apply defaults owned by the selected Stage2 prototype method."""
     merged = dict(values)
-    method = _normalize_stage2_method(merged.get("stage2_method", "consensus_proto"))
+    method = _normalize_stage2_method(merged.get("stage2_method", "separate_proto"))
     merged["stage2_method"] = method
+    merged["prototype_mode"] = "separate"
     defaults = _STAGE2_METHOD_DEFAULTS.get(method, {})
     explicit_keys = set((explicit_overrides or {}).keys())
     for key, value in defaults.items():

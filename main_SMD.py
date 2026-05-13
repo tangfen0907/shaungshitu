@@ -23,11 +23,11 @@ LOCAL_CONFIG_OVERRIDES = {
     "active_view": "dual",
     "dual_view_feature_mode": "avg",
 
-    # Dual-view consensus prototype Stage 2, matched to the PUMP v2 line.
+    # Dual-view separate prototype Stage 2.
     "lambda_cv_stage0": 0.0,
     "lambda_cv_stage1": 0.20,
     "lambda_cv_stage2": 0.0,
-    "stage2_method": "consensus_proto_v2",
+    "stage2_method": "separate_proto",
     "state_dim": 64,
     "num_prototypes": 10,
     "proto_temperature": 0.2,

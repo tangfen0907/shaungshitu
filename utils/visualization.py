@@ -4,7 +4,7 @@ import os
 
 import numpy as np
 
-from utils.scoring import compute_consensus_proto_anomaly_score
+from utils.scoring import compute_separate_proto_anomaly_score
 __all__ = ['_subsample_indices', '_build_train_window_anomaly_counts_for_visualization', '_build_train_window_anomaly_flags_for_visualization', '_has_valid_window_labels', '_project_visual_features_nd', '_visual_sample_indices', '_visual_state_array', '_reference_arrays_from_state', '_mask_from_state', '_labels_from_state', '_cluster_display_id', '_save_train_3d_visualization', '_save_dual_truth_visualizations', '_save_train_test_score_3d_visualization', '_save_stage2_component_score_visualizations']
 
 
@@ -282,7 +282,7 @@ def _current_prototype_centers_for_view(
     feature_dim: int = 0,
 ) -> Tuple[np.ndarray, str]:
     method = str(getattr(self.config, "stage2_method", "")).strip().lower()
-    if method not in {"consensus_proto", "consensus_proto_v2", "paired_proto"}:
+    if method not in {"separate_proto", "consensus_proto", "consensus_proto_v2", "paired_proto"}:
         return np.empty((0, int(feature_dim)), dtype=np.float32), ""
 
     model = getattr(self, "model", None)
@@ -291,9 +291,9 @@ def _current_prototype_centers_for_view(
 
     view_key = _prototype_view_key(feature_view)
     is_paired = (
-        method == "paired_proto"
+        method in {"paired_proto", "separate_proto", "consensus_proto", "consensus_proto_v2"}
         and bool(getattr(model, "is_dual_view", False))
-        and str(getattr(model, "prototype_mode", "")).strip().lower() == "paired"
+        and str(getattr(model, "prototype_mode", "")).strip().lower() == "separate"
     )
     if is_paired:
         head = getattr(model, f"prototype_head_{view_key}", None)
@@ -872,7 +872,7 @@ def _save_train_test_score_3d_visualization(
 
 def _save_stage2_component_score_visualizations(self, stage_key: str = "stage2"):
     method = str(getattr(self.config, "stage2_method", "")).strip().lower()
-    if method not in {"consensus_proto", "consensus_proto_v2", "paired_proto"}:
+    if method not in {"separate_proto", "consensus_proto", "consensus_proto_v2", "paired_proto"}:
         print(f"[Visualize] Skip Stage2 component scores: unsupported stage2_method={method}")
         return
 
@@ -880,7 +880,7 @@ def _save_stage2_component_score_visualizations(self, stage_key: str = "stage2")
     test_outputs = self._collect_consensus_proto_eval_outputs(self.test_loader)
     recon_weight = float(getattr(self.config, "prototype_recon_weight", getattr(self.config, "dual_view_recon_weight", 0.5)))
     lambda_js = float(getattr(self.config, "lambda_js_score", getattr(self.config, "dual_score_weight_cv", 1.0)))
-    _, train_components = compute_consensus_proto_anomaly_score(
+    _, train_components = compute_separate_proto_anomaly_score(
         train_outputs["proto_dist1"],
         train_outputs["proto_dist2"],
         train_outputs["recon1"],
@@ -891,7 +891,7 @@ def _save_stage2_component_score_visualizations(self, stage_key: str = "stage2")
         lambda_js=lambda_js,
         eps=float(getattr(self.config, "robust_eps", 1e-6)),
     )
-    _, test_components = compute_consensus_proto_anomaly_score(
+    _, test_components = compute_separate_proto_anomaly_score(
         test_outputs["proto_dist1"],
         test_outputs["proto_dist2"],
         test_outputs["recon1"],

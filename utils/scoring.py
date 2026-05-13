@@ -9,6 +9,8 @@ __all__ = [
     '_rank01',
     '_robust_positive_norm',
     'js_divergence_np',
+    'entropy_np',
+    'compute_separate_proto_anomaly_score',
     'compute_consensus_proto_anomaly_score',
 ]
 
@@ -77,7 +79,14 @@ def js_divergence_np(q1: np.ndarray, q2: np.ndarray, eps: float = 1e-8) -> np.nd
     return js.astype(np.float32)
 
 
-def compute_consensus_proto_anomaly_score(
+def entropy_np(q: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    q = np.asarray(q, dtype=np.float32)
+    q = np.maximum(q, float(eps))
+    q = q / np.maximum(np.sum(q, axis=1, keepdims=True), float(eps))
+    return (-np.sum(q * np.log(q), axis=1)).astype(np.float32)
+
+
+def compute_separate_proto_anomaly_score(
     proto_dist1: np.ndarray,
     proto_dist2: np.ndarray,
     recon1: np.ndarray,
@@ -95,8 +104,11 @@ def compute_consensus_proto_anomaly_score(
     if not (proto_dist1.shape == proto_dist2.shape == recon1.shape == recon2.shape):
         raise ValueError("Prototype distances and reconstruction scores should align.")
     conflict = js_divergence_np(q1, q2, eps=float(eps))
+    entropy_v1 = entropy_np(q1, eps=float(eps))
+    entropy_v2 = entropy_np(q2, eps=float(eps))
     e1 = proto_dist1 + float(recon_weight) * recon1
     e2 = proto_dist2 + float(recon_weight) * recon2
+    recon_score = (0.5 * (recon1 + recon2)).astype(np.float32)
     proto_dist_gap = np.abs(proto_dist1 - proto_dist2).astype(np.float32)
     max_evidence = np.maximum(e1, e2).astype(np.float32)
     final_score = (max_evidence + float(lambda_js) * conflict).astype(np.float32)
@@ -106,10 +118,25 @@ def compute_consensus_proto_anomaly_score(
         "view2": e2.astype(np.float32),
         "max_evidence": max_evidence,
         "js_conflict": conflict.astype(np.float32),
+        "js": conflict.astype(np.float32),
         "proto_dist_gap": proto_dist_gap,
+        "dist_v1": proto_dist1.astype(np.float32),
+        "dist_v2": proto_dist2.astype(np.float32),
+        "entropy_v1": entropy_v1,
+        "entropy_v2": entropy_v2,
+        "recon_score": recon_score,
         "view1_proto_dist": proto_dist1.astype(np.float32),
         "view2_proto_dist": proto_dist2.astype(np.float32),
         "view1_recon": recon1.astype(np.float32),
         "view2_recon": recon2.astype(np.float32),
     }
 
+
+def compute_consensus_proto_anomaly_score(*args, **kwargs):
+    """Deprecated compatibility alias.
+
+    The current model uses separate View1/View2 prototype heads. The score is
+    still the same max-evidence + JS formulation, but no shared prototype table
+    is involved.
+    """
+    return compute_separate_proto_anomaly_score(*args, **kwargs)

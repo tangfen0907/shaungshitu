@@ -52,21 +52,6 @@ def state_consistency_teacher_loss(
     return 0.5 * (loss1 + loss2)
 
 
-def consensus_prototype_pull_loss(
-    u1: torch.Tensor,
-    u2: torch.Tensor,
-    prototypes: torch.Tensor,
-    target: torch.Tensor,
-) -> torch.Tensor:
-    if u1.numel() == 0:
-        return torch.zeros((), device=prototypes.device, dtype=prototypes.dtype)
-    target = target.long().clamp(0, prototypes.size(0) - 1)
-    target_proto = prototypes[target]
-    pull1 = _squared_l2_distance(u1, target_proto)
-    pull2 = _squared_l2_distance(u2, target_proto)
-    return 0.5 * (pull1 + pull2).mean()
-
-
 def prototype_usage_balance_loss(
     q1: torch.Tensor,
     q2: torch.Tensor = None,

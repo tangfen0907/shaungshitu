@@ -5,7 +5,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from data_loader.triplet_dataset import Stage1AdjacentPairDataset
+from data_factory.triplet_dataset import Stage1AdjacentPairDataset
 
 
 __all__ = [

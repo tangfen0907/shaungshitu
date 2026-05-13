@@ -23,11 +23,11 @@ LOCAL_CONFIG_OVERRIDES = {
     "active_view": "dual",
     "dual_view_feature_mode": "avg",
 
-    # Dual-view paired prototype Stage 2
+    # Dual-view separate prototype Stage 2
     "lambda_cv_stage0": 0.0,
     "lambda_cv_stage1": 0.10,
     "lambda_cv_stage2": 0.0,
-    "stage2_method": "paired_proto",
+    "stage2_method": "separate_proto",
     "state_dim": 64,
     "num_prototypes": 10,
     "proto_temperature": 0.2,

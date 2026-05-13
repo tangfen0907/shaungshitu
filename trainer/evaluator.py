@@ -1,4 +1,4 @@
-﻿from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import json
 import os
@@ -11,7 +11,7 @@ from metrics.Matthews_correlation_coefficient import MCC
 from metrics.affiliation.generics import convert_vector_to_events
 from metrics.affiliation.metrics import pr_from_events
 from metrics.f1_score_f1_pa import get_adjust_F1PA
-from utils.scoring import compute_consensus_proto_anomaly_score
+from utils.scoring import compute_separate_proto_anomaly_score
 
 try:
     from metrics.vus.metrics import get_range_vus_roc
@@ -618,7 +618,7 @@ def _collect_consensus_proto_eval_outputs(self, loader: DataLoader) -> Dict[str,
                 conf2 = outputs["proto_conf2"]
                 recon1 = self._mse_per_sample(x, outputs["x_hat1"], view="v1")
                 recon2 = self._mse_per_sample(x, outputs["x_hat2"], view="v2")
-                if self._stage2_method() == "paired_proto":
+                if self._uses_separate_prototypes():
                     u_cons = torch.nn.functional.normalize(torch.cat([u1, u2], dim=1), dim=1)
                 else:
                     u_cons = torch.nn.functional.normalize(0.5 * (u1 + u2), dim=1)
@@ -656,15 +656,15 @@ def _collect_consensus_proto_eval_outputs(self, loader: DataLoader) -> Dict[str,
 
 
 def _test_dual_consensus_proto(self):
-    is_paired = self._stage2_method() == "paired_proto"
-    family_label = "Paired" if is_paired else "Consensus"
+    use_separate = self._uses_separate_prototypes()
+    family_label = "Separate" if use_separate else "Single"
     print(f"========== Testing Dual-View {family_label} Prototypes ==========")
     train_outputs = self._collect_consensus_proto_eval_outputs(self.train_eval_loader)
     test_outputs = self._collect_consensus_proto_eval_outputs(self.test_loader)
 
     recon_weight = float(getattr(self.config, "prototype_recon_weight", getattr(self.config, "dual_view_recon_weight", 0.5)))
     lambda_js = float(getattr(self.config, "lambda_js_score", getattr(self.config, "dual_score_weight_cv", 1.0)))
-    train_score, train_components = compute_consensus_proto_anomaly_score(
+    train_score, train_components = compute_separate_proto_anomaly_score(
         train_outputs["proto_dist1"],
         train_outputs["proto_dist2"],
         train_outputs["recon1"],
@@ -675,7 +675,7 @@ def _test_dual_consensus_proto(self):
         lambda_js=lambda_js,
         eps=float(getattr(self.config, "robust_eps", 1e-6)),
     )
-    test_score, components = compute_consensus_proto_anomaly_score(
+    test_score, components = compute_separate_proto_anomaly_score(
         test_outputs["proto_dist1"],
         test_outputs["proto_dist2"],
         test_outputs["recon1"],
@@ -697,7 +697,7 @@ def _test_dual_consensus_proto(self):
     )
     distance_analysis = self._analyze_test_latent_distances(test_outputs["u_cons"], y_true)
     metrics = combine_all_evaluation_scores(y_true.copy(), pred_labels.copy(), test_score.copy())
-    proto_head = getattr(self.model, "prototype_head_v1", self.model.prototype_head) if is_paired else self.model.prototype_head
+    proto_head = getattr(self.model, "prototype_head_v1", self.model.prototype_head) if use_separate else self.model.prototype_head
 
     print(
         f"{family_label} prototype scoring: "
@@ -799,7 +799,7 @@ def _test_dual_consensus_proto(self):
         "scores": test_score.astype(np.float32),
         "components": components,
         "train_components": train_components,
-        "score_name": "paired_proto_max_evidence_js" if is_paired else "consensus_proto_max_evidence_js",
+        "score_name": "separate_proto_max_evidence_js" if use_separate else "single_proto_max_evidence_js",
         "test_features": test_outputs["u_cons"],
         "distance_analysis": distance_analysis,
         "component_families": {

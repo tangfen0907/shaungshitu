@@ -1,4 +1,4 @@
-﻿from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import json
 import os
@@ -8,10 +8,9 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from data_loader.triplet_dataset import _extract_window, _to_channel_first_tensor
+from data_factory.triplet_dataset import _extract_window, _to_channel_first_tensor
 from utils.clustering import _cluster_features, _nearest_other_clusters
 from utils.losses import (
-    consensus_prototype_pull_loss,
     consensus_teacher_distribution,
     js_divergence,
     prototype_usage_balance_loss,
@@ -24,6 +23,7 @@ from utils.losses import (
 __all__ = [
     "_stage2_total_epochs",
     "_stage2_method",
+    "_uses_separate_prototypes",
     "_resolve_stage2_schedule",
     "_zero_stage2_loss",
     "_collect_consensus_state_features",
@@ -63,19 +63,30 @@ def _stage2_total_epochs(self) -> int:
 
 
 def _stage2_method(self) -> str:
-    method = str(getattr(self.config, "stage2_method", "consensus_proto")).strip().lower()
+    method = str(getattr(self.config, "stage2_method", "separate_proto")).strip().lower()
     aliases = {
-        "prototype": "consensus_proto",
-        "consensus": "consensus_proto",
-        "consensus_proto_balanced": "consensus_proto_v2",
-        "balanced_consensus_proto": "consensus_proto_v2",
-        "paired": "paired_proto",
-        "paired_prototype": "paired_proto",
+        "prototype": "separate_proto",
+        "consensus": "separate_proto",
+        "consensus_proto": "separate_proto",
+        "consensus_proto_v2": "separate_proto",
+        "consensus_proto_balanced": "separate_proto",
+        "balanced_consensus_proto": "separate_proto",
+        "paired": "separate_proto",
+        "paired_proto": "separate_proto",
+        "paired_prototype": "separate_proto",
+        "separate": "separate_proto",
+        "separate_prototype": "separate_proto",
     }
     method = aliases.get(method, method)
-    if method not in {"consensus_proto", "consensus_proto_v2", "paired_proto"}:
-        raise ValueError("stage2_method should be 'consensus_proto', 'consensus_proto_v2', or 'paired_proto'.")
+    if method in {"shared_proto", "shared_prototype", "common_proto", "common_prototype"}:
+        raise ValueError("Shared/common prototype mode has been removed. Use 'separate_proto'.")
+    if method != "separate_proto":
+        raise ValueError("stage2_method should be 'separate_proto'.")
     return method
+
+
+def _uses_separate_prototypes(self) -> bool:
+    return bool(self._is_dual_view_model())
 
 
 def _resolve_stage2_schedule(self) -> Tuple[int, int]:
@@ -121,7 +132,7 @@ def _collect_consensus_state_features(self, loader: DataLoader) -> np.ndarray:
 
 def _collect_paired_state_features(self, loader: DataLoader) -> Tuple[np.ndarray, np.ndarray]:
     if not self._is_dual_view_model():
-        raise RuntimeError("paired_proto requires a dual-view model.")
+        raise RuntimeError("separate_proto requires a dual-view model.")
     was_training = self.model.training
     self.model.eval()
     features_v1: List[np.ndarray] = []
@@ -136,7 +147,7 @@ def _collect_paired_state_features(self, loader: DataLoader) -> Tuple[np.ndarray
     if was_training:
         self.model.train()
     if not features_v1 or not features_v2:
-        raise RuntimeError("No windows were available for paired prototype initialization.")
+        raise RuntimeError("No windows were available for separate prototype initialization.")
     return (
         np.concatenate(features_v1, axis=0).astype(np.float32),
         np.concatenate(features_v2, axis=0).astype(np.float32),
@@ -200,7 +211,7 @@ def _collect_consensus_proto_outputs(self, loader: DataLoader) -> Dict[str, np.n
                 conf2 = outputs["proto_conf2"]
                 recon1 = self._mse_per_sample(x, outputs["x_hat1"], view="v1")
                 recon2 = self._mse_per_sample(x, outputs["x_hat2"], view="v2")
-                if self._stage2_method() == "paired_proto":
+                if self._uses_separate_prototypes():
                     u_cons = F.normalize(torch.cat([u1, u2], dim=1), dim=1)
                 else:
                     u_cons = F.normalize(0.5 * (u1 + u2), dim=1)
@@ -237,7 +248,7 @@ def _collect_consensus_proto_outputs(self, loader: DataLoader) -> Dict[str, np.n
     result: Dict[str, np.ndarray] = {}
     for key, values in collected.items():
         if not values:
-            raise RuntimeError(f"Consensus prototype collection produced no values for {key}.")
+            raise RuntimeError(f"Separate prototype collection produced no values for {key}.")
         result[key] = np.concatenate(values, axis=0)
     return result
 
@@ -253,12 +264,12 @@ def _initialize_consensus_prototypes(self):
     )
     if centers.shape[0] != num_prototypes:
         raise RuntimeError(
-            "Consensus prototype count does not match the model head. "
+            "Single-view prototype count does not match the model head. "
             f"head={num_prototypes}, kmeans={centers.shape[0]}"
         )
     self.model.init_prototypes_from_centers(centers)
     print(
-        "[Stage2-Consensus] initialized learnable prototypes | "
+        "[Stage2-Single] initialized learnable prototypes | "
         f"cluster_actual={cluster_meta.get('cluster_method_actual', 'kmeans')} | "
         f"K={int(centers.shape[0])} | "
         f"state_dim={int(centers.shape[1])} | "
@@ -287,7 +298,7 @@ def _initialize_paired_prototypes(self):
     label_count = int(labels.max()) + 1 if labels.size else 0
     if label_count != num_prototypes:
         raise RuntimeError(
-            "Paired prototype count does not match the model heads. "
+            "Separate prototype count does not match the model heads. "
             f"head={num_prototypes}, kmeans={label_count}"
         )
 
@@ -303,9 +314,9 @@ def _initialize_paired_prototypes(self):
         centers_v1[proto_id] = features_v1[mask].mean(axis=0)
         centers_v2[proto_id] = features_v2[mask].mean(axis=0)
 
-    self.model.init_paired_prototypes_from_centers(centers_v1, centers_v2)
+    self.model.init_separate_prototypes_from_centers(centers_v1, centers_v2)
     print(
-        "[Stage2-Paired] initialized paired prototypes | "
+        "[Stage2-Separate] initialized separate prototypes | "
         f"cluster_actual={cluster_meta.get('cluster_method_actual', 'kmeans')} | "
         "init=joint_kmeans_l2_zscore | "
         f"K={int(num_prototypes)} | "
@@ -321,10 +332,10 @@ def _build_consensus_proto_state(
     joint_core_mask: np.ndarray,
     round_idx: int,
 ) -> Dict[str, object]:
-    is_paired = self._stage2_method() == "paired_proto" and self._is_dual_view_model()
+    use_separate = self._uses_separate_prototypes()
     centers_v1 = None
     centers_v2 = None
-    if is_paired:
+    if use_separate:
         centers_v1 = self.model.prototype_head_v1.prototypes.detach().cpu().numpy().astype(np.float32)
         centers_v2 = self.model.prototype_head_v2.prototypes.detach().cpu().numpy().astype(np.float32)
         centers = (0.5 * (centers_v1 + centers_v2)).astype(np.float32)
@@ -364,7 +375,7 @@ def _build_consensus_proto_state(
         "core_mask": core_mask.copy(),
         "score_core": score_core,
         "refresh_round": int(round_idx),
-        "bank_mode": "consensus_proto",
+        "bank_mode": "separate_proto",
         "bank_summary": bank_summary,
         "proto_conf1": np.asarray(outputs["conf1"], dtype=np.float32),
         "proto_conf2": np.asarray(outputs["conf2"], dtype=np.float32),
@@ -559,7 +570,7 @@ def _refresh_consensus_joint_core(self, round_idx: int):
             & (np.asarray(outputs["recon1"]) <= recon1_thr)
             & (np.asarray(outputs["recon2"]) <= recon2_thr)
         )
-    if self._stage2_method() in {"consensus_proto_v2", "paired_proto"} and bool(
+    if self._stage2_method() == "separate_proto" and bool(
         getattr(self.config, "stage2_balanced_core", False)
     ):
         labels_for_balance = np.argmax(
@@ -597,7 +608,7 @@ def _refresh_consensus_joint_core(self, round_idx: int):
     self._log_joint_core_label_diagnostics(state, round_idx=round_idx)
     labels = np.asarray(state["cluster_labels"], dtype=np.int64)
     core_counts = np.bincount(labels[self.consensus_joint_core_mask], minlength=state["cluster_centers"].shape[0])
-    prefix = "[Stage2-Paired]" if self._stage2_method() == "paired_proto" else "[Stage2-Consensus]"
+    prefix = "[Stage2-Separate]" if self._uses_separate_prototypes() else "[Stage2-Single]"
     print(
         f"{prefix} refreshed joint core | "
         f"round={int(round_idx)} | "
@@ -638,12 +649,12 @@ def _paired_prototype_relation_loss(
 
 def _consensus_proto_batch_loss(self, raw_batch) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     if not hasattr(self, "consensus_joint_core_mask"):
-        raise RuntimeError("Consensus joint core has not been initialized.")
+        raise RuntimeError("Separate prototype joint core has not been initialized.")
     x, indices = raw_batch
     x = x.float().to(self.device, non_blocking=self._pin_memory())
     indices = indices.long().to(self.device, non_blocking=self._pin_memory())
     outputs = self.model(x, stage="stage2")
-    is_paired = self._stage2_method() == "paired_proto" and self._is_dual_view_model()
+    use_separate = self._uses_separate_prototypes()
     if not self._is_dual_view_model():
         outputs = dict(outputs)
         outputs["u1"] = outputs["u"]
@@ -666,7 +677,7 @@ def _consensus_proto_batch_loss(self, raw_batch) -> Tuple[torch.Tensor, Dict[str
         dtype=torch.bool,
         device=self.device,
     )
-    if is_paired:
+    if use_separate:
         loss_state = js_divergence(
             outputs["q1"],
             outputs["q2"],
@@ -693,7 +704,7 @@ def _consensus_proto_batch_loss(self, raw_batch) -> Tuple[torch.Tensor, Dict[str
             sharpen_temperature=float(getattr(self.config, "q_cons_sharpen_temperature", 0.5)),
         )
         target = torch.argmax(q_teacher, dim=1)
-        if is_paired:
+        if use_separate:
             target1 = target.long().clamp(0, self.model.prototype_head_v1.prototypes.size(0) - 1)
             target2 = target.long().clamp(0, self.model.prototype_head_v2.prototypes.size(0) - 1)
             proto1 = self.model.prototype_head_v1.prototypes[target1]
@@ -702,12 +713,11 @@ def _consensus_proto_batch_loss(self, raw_batch) -> Tuple[torch.Tensor, Dict[str
             pull2 = torch.sum((outputs["u2"][batch_core] - proto2) ** 2, dim=1)
             loss_pull = 0.5 * (pull1 + pull2).mean()
         else:
-            loss_pull = consensus_prototype_pull_loss(
-                outputs["u1"][batch_core],
-                outputs["u2"][batch_core],
-                self.model.prototype_head.prototypes,
-                target,
-            )
+            target_single = target.long().clamp(0, self.model.prototype_head.prototypes.size(0) - 1)
+            proto = self.model.prototype_head.prototypes[target_single]
+            pull1 = torch.sum((outputs["u1"][batch_core] - proto) ** 2, dim=1)
+            pull2 = torch.sum((outputs["u2"][batch_core] - proto) ** 2, dim=1)
+            loss_pull = 0.5 * (pull1 + pull2).mean()
     else:
         loss_pull = self._zero_stage2_loss()
 
@@ -720,7 +730,7 @@ def _consensus_proto_batch_loss(self, raw_batch) -> Tuple[torch.Tensor, Dict[str
             neg_outputs["u1"] = neg_outputs["u"]
             neg_outputs["u2"] = neg_outputs["u"]
         margin = float(getattr(self.config, "proto_repulsion_margin", 1.0))
-        if is_paired:
+        if use_separate:
             rep1 = prototype_repulsion_loss(neg_outputs["u1"], self.model.prototype_head_v1.prototypes, margin)
             rep2 = prototype_repulsion_loss(neg_outputs["u2"], self.model.prototype_head_v2.prototypes, margin)
         else:
@@ -732,7 +742,7 @@ def _consensus_proto_batch_loss(self, raw_batch) -> Tuple[torch.Tensor, Dict[str
 
     lambda_separation = float(getattr(self.config, "lambda_proto_separation", 0.3))
     if lambda_separation != 0.0:
-        if is_paired:
+        if use_separate:
             sep1 = prototype_separation_loss(
                 self.model.prototype_head_v1.prototypes,
                 float(getattr(self.config, "proto_separation_margin", 1.0)),
@@ -767,7 +777,7 @@ def _consensus_proto_batch_loss(self, raw_batch) -> Tuple[torch.Tensor, Dict[str
         loss_usage_balance = self._zero_stage2_loss()
 
     lambda_relation = float(getattr(self.config, "lambda_proto_relation_consistency", 0.0))
-    if is_paired and lambda_relation != 0.0:
+    if use_separate and lambda_relation != 0.0:
         loss_proto_relation = self._paired_prototype_relation_loss(
             self.model.prototype_head_v1.prototypes,
             self.model.prototype_head_v2.prototypes,
@@ -786,7 +796,7 @@ def _consensus_proto_batch_loss(self, raw_batch) -> Tuple[torch.Tensor, Dict[str
             )
             return proto_dist.min()
 
-        if is_paired:
+        if use_separate:
             proto_min_dist = torch.minimum(
                 _min_proto_dist(self.model.prototype_head_v1.prototypes),
                 _min_proto_dist(self.model.prototype_head_v2.prototypes),
@@ -840,7 +850,7 @@ def _stage2_consensus_proto_epoch(
         "proto_min_dist": 0.0,
         "batch_joint_core": 0.0,
     }
-    log_label = "Stage2-Paired" if self._stage2_method() == "paired_proto" else "Stage2-Consensus"
+    log_label = "Stage2-Separate" if self._uses_separate_prototypes() else "Stage2-Single"
     progress = tqdm(
         loader,
         desc=f"{log_label} R{round_idx} E{epoch_in_round}",
@@ -893,8 +903,8 @@ def _run_stage2_consensus_proto_refinement(
     epochs_per_round: int,
     total_stage2_epochs: int,
 ):
-    prefix = "[Stage2-Paired]" if self._stage2_method() == "paired_proto" else "[Stage2-Consensus]"
-    if self._stage2_method() == "paired_proto":
+    prefix = "[Stage2-Separate]" if self._uses_separate_prototypes() else "[Stage2-Single]"
+    if self._uses_separate_prototypes():
         self._initialize_paired_prototypes()
     else:
         self._initialize_consensus_prototypes()

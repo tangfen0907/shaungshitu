@@ -8,8 +8,8 @@ import torch.nn as nn
 from torch.optim import Adam
 from torch.utils.data import DataLoader
 
-from data_loader.data_loader import get_loader_segment
-from data_loader.triplet_dataset import _extract_window, _to_channel_first_tensor
+from data_factory.data_loader import get_loader_segment
+from data_factory.triplet_dataset import _extract_window, _to_channel_first_tensor
 from model.main_net import AnomalyDetector
 from trainer import active_pool as active_pool_methods
 from trainer import evaluator as evaluator_methods
@@ -110,7 +110,7 @@ class Solver:
                 else 1
             ),
             proto_temperature=float(getattr(self.config, "proto_temperature", 0.2)),
-            stage2_method=str(getattr(self.config, "stage2_method", "consensus_proto")),
+            stage2_method=str(getattr(self.config, "stage2_method", "separate_proto")),
             readout_mode=str(getattr(self.config, "readout_mode", "attn_topk_max")),
             topk_ratio=float(getattr(self.config, "topk_ratio", 0.1)),
             topk_k=int(getattr(self.config, "topk_k", 0)),
@@ -212,7 +212,7 @@ class Solver:
         normalized["global_center"] = np.asarray(normalized["global_center"], dtype=np.float32).reshape(-1)
         normalized["nearest_other_cluster"] = np.asarray(normalized["nearest_other_cluster"], dtype=np.int64).reshape(-1)
         normalized["score_core"] = np.asarray(normalized["score_core"], dtype=np.float32).reshape(-1)
-        normalized.setdefault("bank_mode", "consensus_proto")
+        normalized.setdefault("bank_mode", "separate_proto")
         normalized.setdefault("refresh_round", int(max(self.stage2_refresh_round, 0)))
         normalized.setdefault("bank_summary", [])
         return normalized

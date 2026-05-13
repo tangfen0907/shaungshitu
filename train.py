@@ -50,7 +50,11 @@ def parse_common_preset_args(description: str) -> argparse.Namespace:
     parser.add_argument("--dual_score_weight_cv", type=float, default=None)
     parser.add_argument("--dual_view_center_weight", type=float, default=None)
     parser.add_argument("--dual_view_recon_weight", type=float, default=None)
-    parser.add_argument("--stage2_method", choices=["consensus_proto", "consensus_proto_v2", "paired_proto"], default=None)
+    parser.add_argument(
+        "--stage2_method",
+        choices=["separate_proto", "paired_proto", "consensus_proto", "consensus_proto_v2"],
+        default=None,
+    )
     parser.add_argument("--state_dim", type=int, default=None)
     parser.add_argument("--num_prototypes", type=int, default=None)
     parser.add_argument("--proto_temperature", type=float, default=None)
@@ -251,6 +255,7 @@ TRAIN_OVERRIDE_KEYS = [
     "dual_view_center_weight",
     "dual_view_recon_weight",
     "stage2_method",
+    "prototype_mode",
     "state_dim",
     "num_prototypes",
     "proto_temperature",
@@ -353,7 +358,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dual_score_weight_cv", type=float, default=None)
     parser.add_argument("--dual_view_center_weight", type=float, default=None)
     parser.add_argument("--dual_view_recon_weight", type=float, default=None)
-    parser.add_argument("--stage2_method", type=str, default=None, choices=["consensus_proto", "consensus_proto_v2", "paired_proto"])
+    parser.add_argument(
+        "--stage2_method",
+        type=str,
+        default=None,
+        choices=["separate_proto", "paired_proto", "consensus_proto", "consensus_proto_v2"],
+    )
     parser.add_argument("--state_dim", type=int, default=None)
     parser.add_argument("--num_prototypes", type=int, default=None)
     parser.add_argument("--proto_temperature", type=float, default=None)
