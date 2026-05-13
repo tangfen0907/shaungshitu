@@ -26,6 +26,10 @@ def _collect_cli_overrides(args: argparse.Namespace, keys) -> Dict[str, object]:
 
 def parse_common_preset_args(description: str) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=description)
+    parser.add_argument("--data_path", type=str, default=None)
+    parser.add_argument("--train_split_mode", type=str, default=None)
+    parser.add_argument("--test_split_mode", type=str, default=None)
+    parser.add_argument("--scaler_fit_mode", type=str, default=None)
     parser.add_argument("--visualization_method", choices=["pca", "tsne", "umap"], default=None)
     parser.add_argument("--enable_stage1_recon_scoring", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--tcn_layers", type=_parse_tcn_layers, default=None)
@@ -52,7 +56,7 @@ def parse_common_preset_args(description: str) -> argparse.Namespace:
     parser.add_argument("--dual_view_recon_weight", type=float, default=None)
     parser.add_argument(
         "--stage2_method",
-        choices=["separate_proto", "paired_proto", "consensus_proto", "consensus_proto_v2"],
+        choices=["separate_proto"],
         default=None,
     )
     parser.add_argument("--state_dim", type=int, default=None)
@@ -96,6 +100,14 @@ def build_common_preset_overrides(
     args: argparse.Namespace,
 ) -> Dict[str, object]:
     overrides = dict(local_overrides)
+    if getattr(args, "data_path", None) is not None:
+        overrides["data_path"] = str(args.data_path)
+    if getattr(args, "train_split_mode", None) is not None:
+        overrides["train_split_mode"] = str(args.train_split_mode)
+    if getattr(args, "test_split_mode", None) is not None:
+        overrides["test_split_mode"] = str(args.test_split_mode)
+    if getattr(args, "scaler_fit_mode", None) is not None:
+        overrides["scaler_fit_mode"] = str(args.scaler_fit_mode)
     if getattr(args, "visualization_method", None) is not None:
         overrides["visualization_method"] = str(args.visualization_method).strip().lower()
     if getattr(args, "enable_stage1_recon_scoring", None) is not None:
@@ -362,7 +374,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--stage2_method",
         type=str,
         default=None,
-        choices=["separate_proto", "paired_proto", "consensus_proto", "consensus_proto_v2"],
+        choices=["separate_proto"],
     )
     parser.add_argument("--state_dim", type=int, default=None)
     parser.add_argument("--num_prototypes", type=int, default=None)
