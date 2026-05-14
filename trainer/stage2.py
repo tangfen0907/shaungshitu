@@ -17,7 +17,6 @@ from utils.losses import (
     prototype_separation_loss,
     state_consistency_teacher_loss,
 )
-from utils.patch_mask import point_mask_to_patch_mask
 
 
 __all__ = [
@@ -103,40 +102,42 @@ def _collect_separate_view_state_features(self, loader: DataLoader) -> Tuple[np.
         for batch in loader:
             x = self._prepare_batch(batch)
             outputs = self.model(x, stage="stage2")
-            u1_token = outputs["u1_token"]
-            u2_token = outputs["u2_token"]
-            features_v1.append(u1_token.reshape(-1, u1_token.size(-1)).detach().cpu().numpy())
-            features_v2.append(u2_token.reshape(-1, u2_token.size(-1)).detach().cpu().numpy())
+            u1_time = outputs["u1_time"]
+            u2_time = outputs["u2_time"]
+            features_v1.append(u1_time.reshape(-1, u1_time.size(-1)).detach().cpu().numpy())
+            features_v2.append(u2_time.reshape(-1, u2_time.size(-1)).detach().cpu().numpy())
     if was_training:
         self.model.train()
     if not features_v1 or not features_v2:
-        raise RuntimeError("No token features were available for separate prototype initialization.")
+        raise RuntimeError("No time-token features were available for separate prototype initialization.")
 
     features_v1 = np.concatenate(features_v1, axis=0).astype(np.float32)
     features_v2 = np.concatenate(features_v2, axis=0).astype(np.float32)
     if features_v1.shape[0] != features_v2.shape[0]:
         raise RuntimeError(
-            "View token feature counts should match for token-level prototype initialization. "
+            "View time-token feature counts should match for time-level prototype initialization. "
             f"v1={features_v1.shape[0]}, v2={features_v2.shape[0]}"
         )
 
-    total_tokens = int(features_v1.shape[0])
-    max_tokens = int(getattr(self.config, "stage2_token_kmeans_max_tokens", 200000))
-    sampled_tokens = total_tokens
-    if max_tokens > 0 and total_tokens > max_tokens:
+    total_time_tokens = int(features_v1.shape[0])
+    max_tokens = int(
+        getattr(self.config, "stage2_time_kmeans_max_tokens", 200000)
+    )
+    sampled_tokens = total_time_tokens
+    if max_tokens > 0 and total_time_tokens > max_tokens:
         rng = np.random.default_rng(int(getattr(self.config, "seed", 42)))
-        indices = rng.choice(total_tokens, size=max_tokens, replace=False)
+        indices = rng.choice(total_time_tokens, size=max_tokens, replace=False)
         indices.sort()
         features_v1 = features_v1[indices]
         features_v2 = features_v2[indices]
         sampled_tokens = int(max_tokens)
 
     print(
-        "[Stage2-TokenProto] token KMeans features | "
-        f"h1_token_features={tuple(features_v1.shape)} | "
-        f"h2_token_features={tuple(features_v2.shape)} | "
-        f"total_tokens={total_tokens} | "
-        f"sampled_tokens={sampled_tokens}"
+        "[Stage2-TimeProto] time-token KMeans features | "
+        f"h1_time_features={tuple(features_v1.shape)} | "
+        f"h2_time_features={tuple(features_v2.shape)} | "
+        f"total_time_tokens={total_time_tokens} | "
+        f"sampled_time_tokens={sampled_tokens}"
     )
     return features_v1, features_v2
 
@@ -180,12 +181,13 @@ def _collect_separate_proto_outputs(self, loader: DataLoader) -> Dict[str, np.nd
         "conf2": [],
         "recon1": [],
         "recon2": [],
-        "proto_dist1_token_mean": [],
-        "proto_dist1_token_max": [],
-        "proto_dist2_token_mean": [],
-        "proto_dist2_token_max": [],
-        "token_conf1_mean": [],
-        "token_conf2_mean": [],
+        "proto_dist1_time_mean": [],
+        "proto_dist1_time_max": [],
+        "proto_dist2_time_mean": [],
+        "proto_dist2_time_max": [],
+        "time_conf1_mean": [],
+        "time_conf2_mean": [],
+        "time_core_ratio": [],
     }
     with torch.inference_mode():
         for batch in loader:
@@ -204,12 +206,19 @@ def _collect_separate_proto_outputs(self, loader: DataLoader) -> Dict[str, np.nd
                 conf2 = outputs["proto_conf2"]
                 recon1 = self._mse_per_sample(x, outputs["x_hat1"], view="v1")
                 recon2 = self._mse_per_sample(x, outputs["x_hat2"], view="v2")
-                proto_dist1_token_mean = outputs["proto_dist1_token"].reshape(outputs["proto_dist1_token"].size(0), -1).mean(dim=1)
-                proto_dist1_token_max = outputs["proto_dist1_token"].reshape(outputs["proto_dist1_token"].size(0), -1).max(dim=1).values
-                proto_dist2_token_mean = outputs["proto_dist2_token"].reshape(outputs["proto_dist2_token"].size(0), -1).mean(dim=1)
-                proto_dist2_token_max = outputs["proto_dist2_token"].reshape(outputs["proto_dist2_token"].size(0), -1).max(dim=1).values
-                token_conf1_mean = outputs["proto_conf1_token"].reshape(outputs["proto_conf1_token"].size(0), -1).mean(dim=1)
-                token_conf2_mean = outputs["proto_conf2_token"].reshape(outputs["proto_conf2_token"].size(0), -1).mean(dim=1)
+                proto_dist1_time_mean = outputs["proto_dist1_time"].mean(dim=1)
+                proto_dist1_time_max = outputs["proto_dist1_time"].max(dim=1).values
+                proto_dist2_time_mean = outputs["proto_dist2_time"].mean(dim=1)
+                proto_dist2_time_max = outputs["proto_dist2_time"].max(dim=1).values
+                time_conf1_mean = outputs["proto_conf1_time"].mean(dim=1)
+                time_conf2_mean = outputs["proto_conf2_time"].mean(dim=1)
+                tau_time = float(getattr(self.config, "tau_time", getattr(self.config, "tau_conf", 0.7)))
+                time_core = (
+                    (outputs["proto_pred1_time"] == outputs["proto_pred2_time"])
+                    & (outputs["proto_conf1_time"] > tau_time)
+                    & (outputs["proto_conf2_time"] > tau_time)
+                )
+                time_core_ratio = time_core.float().mean(dim=1)
                 if self._uses_separate_prototypes():
                     u_joint = F.normalize(torch.cat([u1, u2], dim=1), dim=1)
                 else:
@@ -228,12 +237,13 @@ def _collect_separate_proto_outputs(self, loader: DataLoader) -> Dict[str, np.nd
                 recon = self._mse_per_sample(x, outputs["x_hat"], view=self._normalize_reconstruction_view())
                 recon1 = recon
                 recon2 = recon
-                proto_dist1_token_mean = proto_dist1
-                proto_dist1_token_max = proto_dist1
-                proto_dist2_token_mean = proto_dist2
-                proto_dist2_token_max = proto_dist2
-                token_conf1_mean = conf1
-                token_conf2_mean = conf2
+                proto_dist1_time_mean = proto_dist1
+                proto_dist1_time_max = proto_dist1
+                proto_dist2_time_mean = proto_dist2
+                proto_dist2_time_max = proto_dist2
+                time_conf1_mean = conf1
+                time_conf2_mean = conf2
+                time_core_ratio = torch.ones_like(conf1)
                 u_joint = F.normalize(u1, dim=1)
             collected["u1"].append(u1.detach().cpu().numpy())
             collected["u2"].append(u2.detach().cpu().numpy())
@@ -248,12 +258,13 @@ def _collect_separate_proto_outputs(self, loader: DataLoader) -> Dict[str, np.nd
             collected["conf2"].append(conf2.detach().cpu().numpy())
             collected["recon1"].append(recon1.detach().cpu().numpy())
             collected["recon2"].append(recon2.detach().cpu().numpy())
-            collected["proto_dist1_token_mean"].append(proto_dist1_token_mean.detach().cpu().numpy())
-            collected["proto_dist1_token_max"].append(proto_dist1_token_max.detach().cpu().numpy())
-            collected["proto_dist2_token_mean"].append(proto_dist2_token_mean.detach().cpu().numpy())
-            collected["proto_dist2_token_max"].append(proto_dist2_token_max.detach().cpu().numpy())
-            collected["token_conf1_mean"].append(token_conf1_mean.detach().cpu().numpy())
-            collected["token_conf2_mean"].append(token_conf2_mean.detach().cpu().numpy())
+            collected["proto_dist1_time_mean"].append(proto_dist1_time_mean.detach().cpu().numpy())
+            collected["proto_dist1_time_max"].append(proto_dist1_time_max.detach().cpu().numpy())
+            collected["proto_dist2_time_mean"].append(proto_dist2_time_mean.detach().cpu().numpy())
+            collected["proto_dist2_time_max"].append(proto_dist2_time_max.detach().cpu().numpy())
+            collected["time_conf1_mean"].append(time_conf1_mean.detach().cpu().numpy())
+            collected["time_conf2_mean"].append(time_conf2_mean.detach().cpu().numpy())
+            collected["time_core_ratio"].append(time_core_ratio.detach().cpu().numpy())
     if was_training:
         self.model.train()
     result: Dict[str, np.ndarray] = {}
@@ -295,9 +306,9 @@ def _initialize_separate_prototypes(self):
 
     self.model.init_separate_prototypes_from_centers(centers_v1, centers_v2)
     print(
-        "[Stage2-TokenProto] initialized token-level separate prototypes | "
+        "[Stage2-TimeProto] initialized time-level separate prototypes | "
         f"cluster_actual={cluster_meta.get('cluster_method_actual', 'kmeans')} | "
-        "init=token_joint_kmeans_l2_zscore | "
+        "init=time_joint_kmeans_l2_zscore | "
         f"K={int(num_prototypes)} | "
         f"D={int(centers_v1.shape[1])} | "
         f"temperature={float(getattr(self.config, 'proto_temperature', 0.2)):.4f}"
@@ -527,12 +538,9 @@ def _log_joint_core_label_diagnostics(self, state: Dict[str, object], round_idx:
 
 def _refresh_separate_joint_core(self, round_idx: int):
     outputs = self._collect_separate_proto_outputs(self.train_eval_loader)
-    tau_conf = float(getattr(self.config, "tau_conf", 0.7))
-    pred1 = np.asarray(outputs["pred1"], dtype=np.int64).reshape(-1)
-    pred2 = np.asarray(outputs["pred2"], dtype=np.int64).reshape(-1)
-    conf1 = np.asarray(outputs["conf1"], dtype=np.float32).reshape(-1)
-    conf2 = np.asarray(outputs["conf2"], dtype=np.float32).reshape(-1)
-    joint_core = (conf1 > tau_conf) & (conf2 > tau_conf) & (pred1 == pred2)
+    tau_time = float(getattr(self.config, "tau_time", getattr(self.config, "tau_conf", 0.7)))
+    time_core_ratio = np.asarray(outputs["time_core_ratio"], dtype=np.float32).reshape(-1)
+    joint_core = time_core_ratio > 0.0
     mode = str(getattr(self.config, "joint_core_mode", "minimal")).strip().lower()
     if mode == "robust":
         ref_mask = joint_core if np.any(joint_core) else np.ones_like(joint_core, dtype=bool)
@@ -587,13 +595,14 @@ def _refresh_separate_joint_core(self, round_idx: int):
     self._log_joint_core_label_diagnostics(state, round_idx=round_idx)
     labels = np.asarray(state["cluster_labels"], dtype=np.int64)
     core_counts = np.bincount(labels[self.separate_joint_core_mask], minlength=state["cluster_centers"].shape[0])
-    prefix = "[Stage2-Separate]"
+    prefix = "[Stage2-TimeProto]"
     print(
-        f"{prefix} refreshed joint core | "
+        f"{prefix} refreshed time-core window summary | "
         f"round={int(round_idx)} | "
         f"mode={mode} | "
-        f"tau_conf={tau_conf:.4f} | "
-        f"joint_core={int(np.sum(self.separate_joint_core_mask))}/{int(joint_core.shape[0])} | "
+        f"tau_time={tau_time:.4f} | "
+        f"window_has_time_core={int(np.sum(self.separate_joint_core_mask))}/{int(joint_core.shape[0])} | "
+        f"mean_time_core_ratio={float(np.mean(time_core_ratio)):.4f} | "
         f"core_by_proto={core_counts.astype(int).tolist()}"
     )
 
@@ -654,8 +663,6 @@ def _inject_stage2_negative_batch_with_mask(self, x: torch.Tensor) -> Tuple[torc
 
 
 def _separate_proto_batch_loss(self, raw_batch) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    if not hasattr(self, "separate_joint_core_mask"):
-        raise RuntimeError("Separate prototype joint core has not been initialized.")
     x, indices = raw_batch
     x = x.float().to(self.device, non_blocking=self._pin_memory())
     indices = indices.long().to(self.device, non_blocking=self._pin_memory())
@@ -677,12 +684,6 @@ def _separate_proto_batch_loss(self, raw_batch) -> Tuple[torch.Tensor, Dict[str,
     rec_v1, rec_v2 = self._dual_reconstruction_losses_from_outputs(outputs, x)
     loss_rec = 0.5 * (rec_v1 + rec_v2)
 
-    core_np = np.asarray(self.separate_joint_core_mask, dtype=bool)
-    batch_core = torch.as_tensor(
-        core_np[indices.detach().cpu().numpy()],
-        dtype=torch.bool,
-        device=self.device,
-    )
     if use_separate:
         loss_state = js_divergence(
             outputs["q1"],
@@ -701,23 +702,38 @@ def _separate_proto_batch_loss(self, raw_batch) -> Tuple[torch.Tensor, Dict[str,
     else:
         loss_state = self._zero_stage2_loss()
 
-    js_token = self._zero_stage2_loss()
+    js_time = self._zero_stage2_loss()
+    time_core_count = self._zero_stage2_loss()
+    time_core_ratio = self._zero_stage2_loss()
     if use_separate:
-        q1_token = outputs["q1_token"]
-        q2_token = outputs["q2_token"]
-        js_token = js_divergence(
-            q1_token.reshape(-1, q1_token.size(-1)),
-            q2_token.reshape(-1, q2_token.size(-1)),
+        q1_time = outputs["q1_time"]
+        q2_time = outputs["q2_time"]
+        js_time = js_divergence(
+            q1_time.reshape(-1, q1_time.size(-1)),
+            q2_time.reshape(-1, q2_time.size(-1)),
             eps=float(getattr(self.config, "robust_eps", 1e-8)),
         ).mean()
-        if torch.any(batch_core):
-            token_core_mask = batch_core[:, None, None].expand_as(outputs["proto_dist1_token"])
-            pull1 = outputs["proto_dist1_token"][token_core_mask].mean()
-            pull2 = outputs["proto_dist2_token"][token_core_mask].mean()
+        tau_time = float(getattr(self.config, "tau_time", getattr(self.config, "tau_conf", 0.7)))
+        time_core = (
+            (outputs["proto_pred1_time"] == outputs["proto_pred2_time"])
+            & (outputs["proto_conf1_time"] > tau_time)
+            & (outputs["proto_conf2_time"] > tau_time)
+        )
+        time_core_count = time_core.float().sum()
+        time_core_ratio = time_core.float().mean()
+        if bool(time_core.any()):
+            pull1 = outputs["proto_dist1_time"][time_core].mean()
+            pull2 = outputs["proto_dist2_time"][time_core].mean()
             loss_pull = 0.5 * (pull1 + pull2)
         else:
             loss_pull = self._zero_stage2_loss()
-    elif torch.any(batch_core):
+    else:
+        core_np = np.asarray(getattr(self, "separate_joint_core_mask", np.ones(x.size(0), dtype=bool)), dtype=bool)
+        batch_core = torch.as_tensor(
+            core_np[indices.detach().cpu().numpy()],
+            dtype=torch.bool,
+            device=self.device,
+        )
         q1_core = outputs["q1"][batch_core]
         q2_core = outputs["q2"][batch_core]
         q_teacher = joint_teacher_distribution(
@@ -732,30 +748,24 @@ def _separate_proto_batch_loss(self, raw_batch) -> Tuple[torch.Tensor, Dict[str,
             pull1 = torch.sum((outputs["u1"][batch_core] - proto) ** 2, dim=1)
             pull2 = torch.sum((outputs["u2"][batch_core] - proto) ** 2, dim=1)
             loss_pull = 0.5 * (pull1 + pull2).mean()
-    else:
-        loss_pull = self._zero_stage2_loss()
 
     lambda_repulsion = float(getattr(self.config, "lambda_proto_repulsion", 1.0))
     loss_repulsion = self._zero_stage2_loss()
     lambda_injected_push = float(getattr(self.config, "lambda_injected_push", 0.1))
     loss_push_injected = self._zero_stage2_loss()
-    injected_patch_ratio = self._zero_stage2_loss()
+    injected_time_ratio = self._zero_stage2_loss()
     injected_dist_mean_before_margin = self._zero_stage2_loss()
     if use_separate and lambda_injected_push != 0.0:
         x_negative, inj_point_mask = self._inject_stage2_negative_batch_with_mask(x)
         neg_outputs = self.model(x_negative, stage="stage2", detach_prototypes=True)
-        inj_patch_mask = point_mask_to_patch_mask(
-            inj_point_mask,
-            patch_len=int(getattr(self.model, "patch_len", getattr(self.config, "patch_len", 16))),
-            patch_stride=int(getattr(self.model, "patch_stride", getattr(self.config, "patch_stride", 8))),
-        ).to(device=self.device, dtype=torch.bool)
-        if inj_patch_mask.shape != neg_outputs["proto_dist1_token"].shape:
+        inj_time_mask = inj_point_mask.bool().any(dim=1).to(device=self.device, dtype=torch.bool)
+        if inj_time_mask.shape != neg_outputs["proto_dist1_time"].shape:
             raise RuntimeError(
-                "Injected patch mask should align with token prototype distances. "
-                f"mask={tuple(inj_patch_mask.shape)}, dist={tuple(neg_outputs['proto_dist1_token'].shape)}"
+                "Injected time mask should align with time prototype distances. "
+                f"mask={tuple(inj_time_mask.shape)}, dist={tuple(neg_outputs['proto_dist1_time'].shape)}"
             )
-        injected_patch_ratio = inj_patch_mask.float().mean()
-        if bool(inj_patch_mask.any()):
+        injected_time_ratio = inj_time_mask.float().mean()
+        if bool(inj_time_mask.any()):
             margin = float(
                 getattr(
                     self.config,
@@ -765,8 +775,8 @@ def _separate_proto_batch_loss(self, raw_batch) -> Tuple[torch.Tensor, Dict[str,
             )
             if margin <= 0.0:
                 margin = float(getattr(self.config, "proto_repulsion_margin", 1.0))
-            dist1_neg = neg_outputs["proto_dist1_token"][inj_patch_mask]
-            dist2_neg = neg_outputs["proto_dist2_token"][inj_patch_mask]
+            dist1_neg = neg_outputs["proto_dist1_time"][inj_time_mask]
+            dist2_neg = neg_outputs["proto_dist2_time"][inj_time_mask]
             injected_dist_mean_before_margin = 0.5 * (dist1_neg.mean() + dist2_neg.mean())
             push1 = F.relu(float(margin) - dist1_neg).pow(2).mean()
             push2 = F.relu(float(margin) - dist2_neg).pow(2).mean()
@@ -849,13 +859,15 @@ def _separate_proto_batch_loss(self, raw_batch) -> Tuple[torch.Tensor, Dict[str,
     return loss, {
         "loss": loss,
         "loss_state": loss_state,
-        "js_token": js_token,
+        "js_time": js_time,
         "loss_pull": loss_pull,
         "L_pull_normal": loss_pull,
         "loss_repulsion": loss_repulsion,
         "loss_push_injected": loss_push_injected,
         "L_push_injected": loss_push_injected,
-        "injected_patch_ratio": injected_patch_ratio,
+        "time_core_count": time_core_count,
+        "time_core_ratio": time_core_ratio,
+        "injected_time_ratio": injected_time_ratio,
         "injected_dist_mean_before_margin": injected_dist_mean_before_margin,
         "loss_proto_separation": loss_proto_separation,
         "loss_usage_balance": loss_usage_balance,
@@ -864,7 +876,7 @@ def _separate_proto_batch_loss(self, raw_batch) -> Tuple[torch.Tensor, Dict[str,
         "rec_v1": rec_v1,
         "rec_v2": rec_v2,
         "proto_min_dist": proto_min_dist,
-        "batch_joint_core": batch_core.float().sum(),
+        "batch_joint_core": time_core_count,
     }
 
 
@@ -880,13 +892,15 @@ def _stage2_separate_proto_epoch(
     totals = {
         "loss": 0.0,
         "loss_state": 0.0,
-        "js_token": 0.0,
+        "js_time": 0.0,
         "loss_pull": 0.0,
         "L_pull_normal": 0.0,
         "loss_repulsion": 0.0,
         "loss_push_injected": 0.0,
         "L_push_injected": 0.0,
-        "injected_patch_ratio": 0.0,
+        "time_core_count": 0.0,
+        "time_core_ratio": 0.0,
+        "injected_time_ratio": 0.0,
         "injected_dist_mean_before_margin": 0.0,
         "loss_proto_separation": 0.0,
         "loss_usage_balance": 0.0,
@@ -895,7 +909,7 @@ def _stage2_separate_proto_epoch(
         "proto_min_dist": 0.0,
         "batch_joint_core": 0.0,
     }
-    log_label = "Stage2-Separate"
+    log_label = "Stage2-TimeProto"
     progress = tqdm(
         loader,
         desc=f"{log_label} R{round_idx} E{epoch_in_round}",
@@ -913,9 +927,10 @@ def _stage2_separate_proto_epoch(
             {
                 "loss": f"{loss.item():.4f}",
                 "state": f"{batch_losses['loss_state'].item():.4f}",
-                "js_tok": f"{batch_losses['js_token'].item():.4f}",
+                "js_time": f"{batch_losses['js_time'].item():.4f}",
                 "pull": f"{batch_losses['loss_pull'].item():.4f}",
                 "push": f"{batch_losses['loss_push_injected'].item():.4f}",
+                "time_core": f"{batch_losses['time_core_ratio'].item():.4f}",
                 "sep": f"{batch_losses['loss_proto_separation'].item():.4f}",
                 "bal": f"{batch_losses['loss_usage_balance'].item():.4f}",
                 "rel": f"{batch_losses['loss_proto_relation'].item():.4f}",
@@ -929,15 +944,17 @@ def _stage2_separate_proto_epoch(
         global_epoch,
         total_epochs,
         {
-            "joint_core": int(np.sum(getattr(self, "separate_joint_core_mask", np.zeros(0, dtype=bool)))),
+            "window_has_time_core": int(np.sum(getattr(self, "separate_joint_core_mask", np.zeros(0, dtype=bool)))),
             "loss": totals["loss"] / denom,
             "loss_state": totals["loss_state"] / denom,
-            "js_token": totals["js_token"] / denom,
+            "js_time": totals["js_time"] / denom,
             "loss_pull": totals["loss_pull"] / denom,
             "L_pull_normal": totals["L_pull_normal"] / denom,
             "loss_push_injected": totals["loss_push_injected"] / denom,
             "L_push_injected": totals["L_push_injected"] / denom,
-            "injected_patch_ratio": totals["injected_patch_ratio"] / denom,
+            "time_core_count": totals["time_core_count"] / denom,
+            "time_core_ratio": totals["time_core_ratio"] / denom,
+            "injected_time_ratio": totals["injected_time_ratio"] / denom,
             "injected_dist_mean_before_margin": totals["injected_dist_mean_before_margin"] / denom,
             "loss_repulsion": totals["loss_repulsion"] / denom,
             "loss_proto_separation": totals["loss_proto_separation"] / denom,
@@ -955,7 +972,7 @@ def _run_stage2_separate_proto_refinement(
     epochs_per_round: int,
     total_stage2_epochs: int,
 ):
-    prefix = "[Stage2-Separate]"
+    prefix = "[Stage2-TimeProto]"
     self._initialize_separate_prototypes()
 
     global_epoch = 1
@@ -965,12 +982,12 @@ def _run_stage2_separate_proto_refinement(
             if global_epoch == 1:
                 print(
                     f"{prefix} Epoch refresh {global_epoch}/{total_stage2_epochs}: "
-                    "use initialized prototypes and joint core"
+                    "use initialized prototypes and time-core summary"
                 )
             else:
                 print(
                     f"{prefix} Epoch refresh {global_epoch}/{total_stage2_epochs}: "
-                    "refresh joint core from current q1/q2"
+                    "refresh time-core summary from current time assignments"
                 )
                 self._refresh_separate_joint_core(round_idx=global_epoch)
             loader = self._build_stage2_separate_loader()

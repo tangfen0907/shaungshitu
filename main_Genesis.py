@@ -78,7 +78,7 @@ LOCAL_CONFIG_OVERRIDES = {
     'lambda_proto_relation_consistency': 0.0,
     'lambda_proto_usage_balance': 0.05,
     'stage2_lambda_rec': 1.0,
-    'stage2_token_kmeans_max_tokens': 200000,
+    'stage2_time_kmeans_max_tokens': 200000,
     'lambda_injected_push': 0.1,
     'stage2_injected_margin': 1.0,
     'stage2_relational_negative_p': 0.0,

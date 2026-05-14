@@ -67,7 +67,7 @@ class Config:
     stage2_balanced_core_min_per_proto: int = 0
     lambda_proto_usage_balance: float = 0.0
     lambda_proto_relation_consistency: float = 0.0
-    stage2_token_kmeans_max_tokens: int = 200000
+    stage2_time_kmeans_max_tokens: int = 200000
     lambda_injected_push: float = 0.1
     stage2_injected_margin: float = 1.0
     lambda_js_score: float = 1.0
@@ -200,7 +200,7 @@ _COMMON_EXPLICIT: Dict[str, object] = {
     "stage2_balanced_core_max_fraction": 1.0,
     "stage2_balanced_core_min_per_proto": 0,
     "lambda_proto_usage_balance": 0.0,
-    "stage2_token_kmeans_max_tokens": 200000,
+    "stage2_time_kmeans_max_tokens": 200000,
     "lambda_injected_push": 0.1,
     "stage2_injected_margin": 1.0,
     "lambda_js_score": 1.0,

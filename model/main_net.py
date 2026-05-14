@@ -103,18 +103,10 @@ class AnomalyDetector(nn.Module):
                 output_len=1,
                 hidden_dim=max(128, latent_dim * 2),
             )
-            token_dim = int(tuple(tcn_layers)[0])
-            self.token_projector_v1 = (
-                nn.Identity()
-                if token_dim == self.state_dim
-                else nn.Linear(token_dim, self.state_dim)
-            )
-            self.token_projector_v2 = (
-                nn.Identity()
-                if token_dim == self.state_dim
-                else nn.Linear(token_dim, self.state_dim)
-            )
-            self._token_proto_shape_logged = False
+            patch_token_dim = int(tuple(tcn_layers)[0])
+            self.patch_to_time_v1 = nn.Linear(patch_token_dim, self.patch_len * self.state_dim)
+            self.patch_to_time_v2 = nn.Linear(patch_token_dim, self.patch_len * self.state_dim)
+            self._time_proto_shape_logged = False
         elif self.active_view == "v1":
             encoder_in_channels = self.raw_in_channels
             self.encoder_seq_len = self.raw_seq_len
@@ -402,19 +394,48 @@ class AnomalyDetector(nn.Module):
             return self.reconstructor_v2(z)
         raise ValueError("view should be 'v1' or 'v2'.")
 
-    def _token_topk_mean(self, token_dist: torch.Tensor) -> torch.Tensor:
-        if token_dist.dim() < 2:
-            return token_dist.reshape(token_dist.size(0), -1).mean(dim=1)
-        flat = token_dist.reshape(token_dist.size(0), -1)
-        token_count = int(flat.size(1))
-        if token_count <= 0:
+    def _patch_tokens_to_time(
+        self,
+        h_patch: torch.Tensor,
+        projector: nn.Module,
+        length: int,
+    ) -> torch.Tensor:
+        if h_patch.dim() != 4:
+            raise ValueError(f"patch-to-time expects [B, N, P, D], got {tuple(h_patch.shape)}")
+        batch_size, num_variables, patch_count, _ = h_patch.shape
+        length = max(1, int(length))
+        expanded = projector(h_patch).reshape(
+            batch_size,
+            num_variables,
+            patch_count,
+            self.patch_len,
+            self.state_dim,
+        )
+        time_values = h_patch.new_zeros(batch_size, num_variables, length, self.state_dim)
+        counts = h_patch.new_zeros(length)
+        for patch_idx in range(patch_count):
+            start = int(patch_idx) * self.patch_stride
+            if start >= length:
+                continue
+            end = min(start + self.patch_len, length)
+            span = end - start
+            time_values[:, :, start:end, :] = time_values[:, :, start:end, :] + expanded[:, :, patch_idx, :span, :]
+            counts[start:end] = counts[start:end] + 1.0
+        return time_values / counts.clamp_min(1.0).view(1, 1, length, 1)
+
+    def _time_topk_mean(self, time_dist: torch.Tensor) -> torch.Tensor:
+        if time_dist.dim() < 2:
+            return time_dist.reshape(time_dist.size(0), -1).mean(dim=1)
+        flat = time_dist.reshape(time_dist.size(0), -1)
+        time_count = int(flat.size(1))
+        if time_count <= 0:
             return flat.mean(dim=1)
         if self.topk_k > 0:
-            k = max(1, min(int(self.topk_k), token_count))
+            k = max(1, min(int(self.topk_k), time_count))
         else:
             ratio = self.topk_ratio if self.topk_ratio > 0 else 1.0
-            k = max(1, min(token_count, int(np.ceil(float(token_count) * float(ratio)))))
-        if k >= token_count:
+            k = max(1, min(time_count, int(np.ceil(float(time_count) * float(ratio)))))
+        if k >= time_count:
             return flat.mean(dim=1)
         return torch.topk(flat, k=k, dim=1, largest=True, sorted=False).values.mean(dim=1)
 
@@ -457,55 +478,60 @@ class AnomalyDetector(nn.Module):
             if self.is_dual_view:
                 h1_patch = dual_features["h1_patch"]
                 h2_patch = dual_features["h2_patch"]
-                u1_token = self.token_projector_v1(h1_patch)
-                u2_token = self.token_projector_v2(h2_patch)
-                proto1 = self.prototype_head_v1(u1_token, detach_prototypes=detach_prototypes)
-                proto2 = self.prototype_head_v2(u2_token, detach_prototypes=detach_prototypes)
-                q1 = proto1["q"].mean(dim=(1, 2))
-                q2 = proto2["q"].mean(dim=(1, 2))
+                h1_time_var = self._patch_tokens_to_time(h1_patch, self.patch_to_time_v1, x.size(-1))
+                h2_time_var = self._patch_tokens_to_time(h2_patch, self.patch_to_time_v2, x.size(-1))
+                u1_time = h1_time_var.mean(dim=1)
+                u2_time = h2_time_var.mean(dim=1)
+                proto1 = self.prototype_head_v1(u1_time, detach_prototypes=detach_prototypes)
+                proto2 = self.prototype_head_v2(u2_time, detach_prototypes=detach_prototypes)
+                q1 = proto1["q"].mean(dim=1)
+                q2 = proto2["q"].mean(dim=1)
                 proto_conf1, proto_pred1 = torch.max(q1, dim=-1)
                 proto_conf2, proto_pred2 = torch.max(q2, dim=-1)
-                proto_dist1 = self._token_topk_mean(proto1["min_dist"])
-                proto_dist2 = self._token_topk_mean(proto2["min_dist"])
-                u1 = u1_token.mean(dim=(1, 2))
-                u2 = u2_token.mean(dim=(1, 2))
-                if not self._token_proto_shape_logged:
+                proto_dist1 = self._time_topk_mean(proto1["min_dist"])
+                proto_dist2 = self._time_topk_mean(proto2["min_dist"])
+                u1 = u1_time.mean(dim=1)
+                u2 = u2_time.mean(dim=1)
+                if not self._time_proto_shape_logged:
                     print(
-                        "[Stage2-TokenProto] forward shapes | "
+                        "[Stage2-TimeProto] forward shapes | "
                         f"h1_patch={tuple(h1_patch.shape)} | "
-                        f"u1_token={tuple(u1_token.shape)} | "
-                        f"q1_token={tuple(proto1['q'].shape)} | "
-                        f"proto_dist1_token={tuple(proto1['min_dist'].shape)} | "
+                        f"h1_time_var={tuple(h1_time_var.shape)} | "
+                        f"u1_time={tuple(u1_time.shape)} | "
+                        f"q1_time={tuple(proto1['q'].shape)} | "
+                        f"proto_dist1_time={tuple(proto1['min_dist'].shape)} | "
                         f"q1={tuple(q1.shape)} | "
                         f"proto_dist1={tuple(proto_dist1.shape)}"
                     )
-                    self._token_proto_shape_logged = True
+                    self._time_proto_shape_logged = True
                 outputs.update(
                     {
                         "u1": u1,
                         "u2": u2,
-                        "u1_token": u1_token,
-                        "u2_token": u2_token,
+                        "h1_time_var": h1_time_var,
+                        "h2_time_var": h2_time_var,
+                        "u1_time": u1_time,
+                        "u2_time": u2_time,
                         "q1": q1,
                         "q2": q2,
-                        "q1_token": proto1["q"],
-                        "q2_token": proto2["q"],
-                        "proto_dist_matrix1": proto1["dist_sq"].mean(dim=(1, 2)),
-                        "proto_dist_matrix2": proto2["dist_sq"].mean(dim=(1, 2)),
-                        "proto_dist_matrix1_token": proto1["dist_sq"],
-                        "proto_dist_matrix2_token": proto2["dist_sq"],
+                        "q1_time": proto1["q"],
+                        "q2_time": proto2["q"],
+                        "proto_dist_matrix1": proto1["dist_sq"].mean(dim=1),
+                        "proto_dist_matrix2": proto2["dist_sq"].mean(dim=1),
+                        "proto_dist_matrix1_time": proto1["dist_sq"],
+                        "proto_dist_matrix2_time": proto2["dist_sq"],
                         "proto_dist1": proto_dist1,
                         "proto_dist2": proto_dist2,
-                        "proto_dist1_token": proto1["min_dist"],
-                        "proto_dist2_token": proto2["min_dist"],
+                        "proto_dist1_time": proto1["min_dist"],
+                        "proto_dist2_time": proto2["min_dist"],
                         "proto_pred1": proto_pred1,
                         "proto_pred2": proto_pred2,
-                        "proto_pred1_token": proto1["pred"],
-                        "proto_pred2_token": proto2["pred"],
+                        "proto_pred1_time": proto1["pred"],
+                        "proto_pred2_time": proto2["pred"],
                         "proto_conf1": proto_conf1,
                         "proto_conf2": proto_conf2,
-                        "proto_conf1_token": proto1["conf"],
-                        "proto_conf2_token": proto2["conf"],
+                        "proto_conf1_time": proto1["conf"],
+                        "proto_conf2_time": proto2["conf"],
                     }
                 )
             else:

@@ -136,7 +136,7 @@ TRAIN_OVERRIDE_KEYS = [
     "stage2_balanced_core_max_fraction",
     "stage2_balanced_core_min_per_proto",
     "lambda_proto_usage_balance",
-    "stage2_token_kmeans_max_tokens",
+    "stage2_time_kmeans_max_tokens",
     "lambda_injected_push",
     "stage2_injected_margin",
     "lambda_js_score",
@@ -261,7 +261,7 @@ def build_parser(
     parser.add_argument("--stage2_balanced_core_max_fraction", type=float, default=None)
     parser.add_argument("--stage2_balanced_core_min_per_proto", type=int, default=None)
     parser.add_argument("--lambda_proto_usage_balance", type=float, default=None)
-    parser.add_argument("--stage2_token_kmeans_max_tokens", type=int, default=None)
+    parser.add_argument("--stage2_time_kmeans_max_tokens", type=int, default=None)
     parser.add_argument("--lambda_injected_push", type=float, default=None)
     parser.add_argument("--stage2_injected_margin", type=float, default=None)
     parser.add_argument("--lambda_js_score", type=float, default=None)
