@@ -62,7 +62,7 @@ def parse_common_preset_args(description: str) -> argparse.Namespace:
     parser.add_argument("--state_dim", type=int, default=None)
     parser.add_argument("--num_prototypes", type=int, default=None)
     parser.add_argument("--proto_temperature", type=float, default=None)
-    parser.add_argument("--q_cons_sharpen_temperature", type=float, default=None)
+    parser.add_argument("--q_joint_sharpen_temperature", type=float, default=None)
     parser.add_argument("--lambda_state_consistency", type=float, default=None)
     parser.add_argument("--lambda_proto_pull", type=float, default=None)
     parser.add_argument("--lambda_proto_repulsion", type=float, default=None)
@@ -156,8 +156,8 @@ def build_common_preset_overrides(
         overrides["num_prototypes"] = int(args.num_prototypes)
     if getattr(args, "proto_temperature", None) is not None:
         overrides["proto_temperature"] = float(args.proto_temperature)
-    if getattr(args, "q_cons_sharpen_temperature", None) is not None:
-        overrides["q_cons_sharpen_temperature"] = float(args.q_cons_sharpen_temperature)
+    if getattr(args, "q_joint_sharpen_temperature", None) is not None:
+        overrides["q_joint_sharpen_temperature"] = float(args.q_joint_sharpen_temperature)
     if getattr(args, "lambda_state_consistency", None) is not None:
         overrides["lambda_state_consistency"] = float(args.lambda_state_consistency)
     if getattr(args, "lambda_proto_pull", None) is not None:
@@ -271,7 +271,7 @@ TRAIN_OVERRIDE_KEYS = [
     "state_dim",
     "num_prototypes",
     "proto_temperature",
-    "q_cons_sharpen_temperature",
+    "q_joint_sharpen_temperature",
     "lambda_state_consistency",
     "lambda_proto_pull",
     "lambda_proto_repulsion",
@@ -379,7 +379,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--state_dim", type=int, default=None)
     parser.add_argument("--num_prototypes", type=int, default=None)
     parser.add_argument("--proto_temperature", type=float, default=None)
-    parser.add_argument("--q_cons_sharpen_temperature", type=float, default=None)
+    parser.add_argument("--q_joint_sharpen_temperature", type=float, default=None)
     parser.add_argument("--lambda_state_consistency", type=float, default=None)
     parser.add_argument("--lambda_proto_pull", type=float, default=None)
     parser.add_argument("--lambda_proto_repulsion", type=float, default=None)

@@ -25,7 +25,7 @@ def js_divergence(q1: torch.Tensor, q2: torch.Tensor, eps: float = 1e-8) -> torc
     return 0.5 * (kl1 + kl2)
 
 
-def consensus_teacher_distribution(
+def joint_teacher_distribution(
     q1: torch.Tensor,
     q2: torch.Tensor,
     sharpen_temperature: float = 0.5,

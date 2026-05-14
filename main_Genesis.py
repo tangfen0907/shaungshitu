@@ -1,8 +1,3 @@
-import sys
-
-from main_dmt import build_parser as build_dmt_parser
-
-
 RUN_NAME = 'genesis_experiment'
 LOCAL_CONFIG_OVERRIDES = {
     'dataset': 'Genesis',
@@ -21,25 +16,7 @@ LOCAL_CONFIG_OVERRIDES = {
 }
 
 
-def run_dmt_preset(argv):
-    parser = build_dmt_parser()
-    parser.set_defaults(
-        dataset='Genesis',
-        data_path='dataset/Genesis',
-        input_c=18,
-    )
-    args = parser.parse_args(argv)
-    from solver_dmt import DMTSolver
-
-    DMTSolver(args).run()
-
-
 def main():
-    if '--dmt' in sys.argv[1:]:
-        argv = [item for item in sys.argv[1:] if item != '--dmt']
-        run_dmt_preset(argv)
-        return
-
     from train import parse_common_preset_args, run_dataset_preset
 
     args = parse_common_preset_args("Run the Genesis preset experiment.")

@@ -21,7 +21,7 @@ except Exception:
     _VUS_AVAILABLE = False
 
 
-__all__ = ['_build_window_anomaly_flags', '_build_window_anomaly_counts', '_nearest_center_scores', '_threshold_scores', '_pairwise_distance_block', '_init_distance_stats', '_update_distance_stats', '_summarize_distance_stats', '_within_class_distance_stats', '_cross_class_distance_stats', '_sample_within_class_distances', '_sample_cross_class_distances', '_select_distance_analysis_subset', '_analyze_test_latent_distances', '_collect_reconstruction_scores', '_collect_dual_reconstruction_scores', '_cross_view_disagreement_from_evidence', '_save_stage1_reconstruction_scoring', '_format_index_count_preview', '_evaluate_score_family', '_normalize_score_pair', '_collect_cross_view_scores', '_collect_consensus_proto_eval_outputs', '_test_dual_consensus_proto', 'run_evaluation']
+__all__ = ['_build_window_anomaly_flags', '_build_window_anomaly_counts', '_nearest_center_scores', '_threshold_scores', '_pairwise_distance_block', '_init_distance_stats', '_update_distance_stats', '_summarize_distance_stats', '_within_class_distance_stats', '_cross_class_distance_stats', '_sample_within_class_distances', '_sample_cross_class_distances', '_select_distance_analysis_subset', '_analyze_test_latent_distances', '_collect_reconstruction_scores', '_collect_dual_reconstruction_scores', '_cross_view_disagreement_from_evidence', '_save_stage1_reconstruction_scoring', '_format_index_count_preview', '_evaluate_score_family', '_normalize_score_pair', '_collect_cross_view_scores', '_collect_separate_proto_eval_outputs', '_test_dual_separate_proto', 'run_evaluation']
 
 
 def combine_all_evaluation_scores(y_test, pred_labels, anomaly_scores):
@@ -583,13 +583,13 @@ def _collect_cross_view_scores(self, loader: DataLoader) -> np.ndarray:
     return np.concatenate(scores, axis=0).astype(np.float32)
 
 
-def _collect_consensus_proto_eval_outputs(self, loader: DataLoader) -> Dict[str, np.ndarray]:
+def _collect_separate_proto_eval_outputs(self, loader: DataLoader) -> Dict[str, np.ndarray]:
     was_training = self.model.training
     self.model.eval()
     collected = {
         "u1": [],
         "u2": [],
-        "u_cons": [],
+        "u_joint": [],
         "q1": [],
         "q2": [],
         "proto_dist1": [],
@@ -619,9 +619,9 @@ def _collect_consensus_proto_eval_outputs(self, loader: DataLoader) -> Dict[str,
                 recon1 = self._mse_per_sample(x, outputs["x_hat1"], view="v1")
                 recon2 = self._mse_per_sample(x, outputs["x_hat2"], view="v2")
                 if self._uses_separate_prototypes():
-                    u_cons = torch.nn.functional.normalize(torch.cat([u1, u2], dim=1), dim=1)
+                    u_joint = torch.nn.functional.normalize(torch.cat([u1, u2], dim=1), dim=1)
                 else:
-                    u_cons = torch.nn.functional.normalize(0.5 * (u1 + u2), dim=1)
+                    u_joint = torch.nn.functional.normalize(0.5 * (u1 + u2), dim=1)
             else:
                 u1 = outputs["u"]
                 u2 = outputs["u"]
@@ -636,10 +636,10 @@ def _collect_consensus_proto_eval_outputs(self, loader: DataLoader) -> Dict[str,
                 recon = self._mse_per_sample(x, outputs["x_hat"], view=self._normalize_reconstruction_view())
                 recon1 = recon
                 recon2 = recon
-                u_cons = torch.nn.functional.normalize(u1, dim=1)
+                u_joint = torch.nn.functional.normalize(u1, dim=1)
             collected["u1"].append(u1.detach().cpu().numpy())
             collected["u2"].append(u2.detach().cpu().numpy())
-            collected["u_cons"].append(u_cons.detach().cpu().numpy())
+            collected["u_joint"].append(u_joint.detach().cpu().numpy())
             collected["q1"].append(q1.detach().cpu().numpy())
             collected["q2"].append(q2.detach().cpu().numpy())
             collected["proto_dist1"].append(proto_dist1.detach().cpu().numpy())
@@ -655,12 +655,12 @@ def _collect_consensus_proto_eval_outputs(self, loader: DataLoader) -> Dict[str,
     return {key: np.concatenate(value, axis=0).astype(np.float32) for key, value in collected.items()}
 
 
-def _test_dual_consensus_proto(self):
-    use_separate = self._uses_separate_prototypes()
-    family_label = "Separate" if use_separate else "Single"
+def _test_dual_separate_proto(self):
+    self._uses_separate_prototypes()
+    family_label = "Separate"
     print(f"========== Testing Dual-View {family_label} Prototypes ==========")
-    train_outputs = self._collect_consensus_proto_eval_outputs(self.train_eval_loader)
-    test_outputs = self._collect_consensus_proto_eval_outputs(self.test_loader)
+    train_outputs = self._collect_separate_proto_eval_outputs(self.train_eval_loader)
+    test_outputs = self._collect_separate_proto_eval_outputs(self.test_loader)
 
     recon_weight = float(getattr(self.config, "prototype_recon_weight", getattr(self.config, "dual_view_recon_weight", 0.5)))
     lambda_js = float(getattr(self.config, "lambda_js_score", getattr(self.config, "dual_score_weight_cv", 1.0)))
@@ -695,9 +695,9 @@ def _test_dual_consensus_proto(self):
         f"[Test][Labels] window labels: normal={int(np.sum(y_true == 0))} | "
         f"anomaly={int(np.sum(y_true == 1))} | total={int(y_true.shape[0])}"
     )
-    distance_analysis = self._analyze_test_latent_distances(test_outputs["u_cons"], y_true)
+    distance_analysis = self._analyze_test_latent_distances(test_outputs["u_joint"], y_true)
     metrics = combine_all_evaluation_scores(y_true.copy(), pred_labels.copy(), test_score.copy())
-    proto_head = getattr(self.model, "prototype_head_v1", self.model.prototype_head) if use_separate else self.model.prototype_head
+    proto_head = self.model.prototype_head_v1
 
     print(
         f"{family_label} prototype scoring: "
@@ -799,8 +799,8 @@ def _test_dual_consensus_proto(self):
         "scores": test_score.astype(np.float32),
         "components": components,
         "train_components": train_components,
-        "score_name": "separate_proto_max_evidence_js" if use_separate else "single_proto_max_evidence_js",
-        "test_features": test_outputs["u_cons"],
+        "score_name": "separate_proto_max_evidence_js",
+        "test_features": test_outputs["u_joint"],
         "distance_analysis": distance_analysis,
         "component_families": {
             "view1_proto_dist": {
@@ -873,4 +873,4 @@ def _test_dual_consensus_proto(self):
 
 def run_evaluation(solver):
     self = solver
-    return self._test_dual_consensus_proto()
+    return self._test_dual_separate_proto()

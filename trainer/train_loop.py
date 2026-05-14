@@ -95,7 +95,7 @@ def run_train_loop(solver):
     )
     title = "Dual-View Separate Prototype Learning"
     print(f"========== Stage 2 {title} ==========")
-    self._run_stage2_consensus_proto_refinement(
+    self._run_stage2_separate_proto_refinement(
         num_stage2_rounds=num_stage2_rounds,
         epochs_per_round=epochs_per_round,
         total_stage2_epochs=total_stage2_epochs,

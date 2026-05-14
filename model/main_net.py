@@ -141,10 +141,6 @@ class AnomalyDetector(nn.Module):
             )
             self.prototype_head_v1 = self.prototype_heads.prototype_head_v1
             self.prototype_head_v2 = self.prototype_heads.prototype_head_v2
-            # Compatibility alias for old utilities that expect
-            # model.prototype_head to exist. In dual-view mode this points to
-            # View1 only and must not be used for View2 assignment.
-            self.prototype_head = self.prototype_head_v1
         else:
             self.prototype_head = PrototypeHead(
                 num_prototypes=self.num_prototypes,
@@ -345,11 +341,7 @@ class AnomalyDetector(nn.Module):
     @torch.no_grad()
     def init_prototypes_from_centers(self, centers: Union[np.ndarray, torch.Tensor]):
         if self.is_dual_view:
-            # Deprecated compatibility path: initialize two independent
-            # prototype tables from the same centers without sharing params.
-            self.prototype_head_v1.init_from_centers(centers)
-            self.prototype_head_v2.init_from_centers(centers)
-            return
+            raise RuntimeError("Use init_separate_prototypes_from_centers in dual-view mode.")
         self.prototype_head.init_from_centers(centers)
 
     @torch.no_grad()
@@ -363,15 +355,6 @@ class AnomalyDetector(nn.Module):
         self.prototype_head_v1.init_from_centers(centers_v1)
         self.prototype_head_v2.init_from_centers(centers_v2)
 
-    @torch.no_grad()
-    def init_paired_prototypes_from_centers(
-        self,
-        centers_v1: Union[np.ndarray, torch.Tensor],
-        centers_v2: Union[np.ndarray, torch.Tensor],
-    ):
-        # Backward-compatible name. The active design is separate prototypes,
-        # not a shared/common prototype table.
-        self.init_separate_prototypes_from_centers(centers_v1, centers_v2)
 
     def encode(self, x: torch.Tensor, view: str = None) -> torch.Tensor:
         if self.is_dual_view:
@@ -408,8 +391,7 @@ class AnomalyDetector(nn.Module):
         raise ValueError("view should be 'v1' or 'v2'.")
 
     def forward(self, x: torch.Tensor, stage: str = "stage1"):
-        """
-        涓嶅悓闃舵缁熶竴杩斿洖瀛楀吀锛岄伩鍏嶄笂灞傝缁冮€昏緫鍒嗘敮杩囧銆?        """
+        """Return reconstruction and optional prototype outputs for the requested stage."""
         if self.is_dual_view:
             dual_features = self.dual_encoder(x)
             z1 = dual_features["z1_global"]
@@ -443,7 +425,7 @@ class AnomalyDetector(nn.Module):
                 }
             )
 
-        if stage in {"stage2", "test", "separate_proto", "consensus_proto"}:
+        if stage in {"stage2", "test", "separate_proto"}:
             if self.is_dual_view:
                 u1, u2 = self.state_from_views(z1, z2)
                 proto1 = self.prototype_head_v1(u1)

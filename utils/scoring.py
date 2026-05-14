@@ -11,7 +11,6 @@ __all__ = [
     'js_divergence_np',
     'entropy_np',
     'compute_separate_proto_anomaly_score',
-    'compute_consensus_proto_anomaly_score',
 ]
 
 
@@ -130,13 +129,3 @@ def compute_separate_proto_anomaly_score(
         "view1_recon": recon1.astype(np.float32),
         "view2_recon": recon2.astype(np.float32),
     }
-
-
-def compute_consensus_proto_anomaly_score(*args, **kwargs):
-    """Deprecated compatibility alias.
-
-    The current model uses separate View1/View2 prototype heads. The score is
-    still the same max-evidence + JS formulation, but no shared prototype table
-    is involved.
-    """
-    return compute_separate_proto_anomaly_score(*args, **kwargs)

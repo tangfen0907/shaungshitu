@@ -282,7 +282,7 @@ def _current_prototype_centers_for_view(
     feature_dim: int = 0,
 ) -> Tuple[np.ndarray, str]:
     method = str(getattr(self.config, "stage2_method", "")).strip().lower()
-    if method not in {"separate_proto", "consensus_proto", "consensus_proto_v2", "paired_proto"}:
+    if method != "separate_proto":
         return np.empty((0, int(feature_dim)), dtype=np.float32), ""
 
     model = getattr(self, "model", None)
@@ -290,12 +290,11 @@ def _current_prototype_centers_for_view(
         return np.empty((0, int(feature_dim)), dtype=np.float32), ""
 
     view_key = _prototype_view_key(feature_view)
-    is_paired = (
-        method in {"paired_proto", "separate_proto", "consensus_proto", "consensus_proto_v2"}
-        and bool(getattr(model, "is_dual_view", False))
+    is_separate = (
+        bool(getattr(model, "is_dual_view", False))
         and str(getattr(model, "prototype_mode", "")).strip().lower() == "separate"
     )
-    if is_paired:
+    if is_separate:
         head = getattr(model, f"prototype_head_{view_key}", None)
         trace_name = "View2 Prototypes" if view_key == "v2" else "View1 Prototypes"
     else:
@@ -872,12 +871,12 @@ def _save_train_test_score_3d_visualization(
 
 def _save_stage2_component_score_visualizations(self, stage_key: str = "stage2"):
     method = str(getattr(self.config, "stage2_method", "")).strip().lower()
-    if method not in {"separate_proto", "consensus_proto", "consensus_proto_v2", "paired_proto"}:
+    if method != "separate_proto":
         print(f"[Visualize] Skip Stage2 component scores: unsupported stage2_method={method}")
         return
 
-    train_outputs = self._collect_consensus_proto_eval_outputs(self.train_eval_loader)
-    test_outputs = self._collect_consensus_proto_eval_outputs(self.test_loader)
+    train_outputs = self._collect_separate_proto_eval_outputs(self.train_eval_loader)
+    test_outputs = self._collect_separate_proto_eval_outputs(self.test_loader)
     recon_weight = float(getattr(self.config, "prototype_recon_weight", getattr(self.config, "dual_view_recon_weight", 0.5)))
     lambda_js = float(getattr(self.config, "lambda_js_score", getattr(self.config, "dual_score_weight_cv", 1.0)))
     _, train_components = compute_separate_proto_anomaly_score(

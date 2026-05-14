@@ -50,7 +50,7 @@ class Config:
     state_dim: int = 0
     num_prototypes: int = 0
     proto_temperature: float = 0.2
-    q_cons_sharpen_temperature: float = 0.5
+    q_joint_sharpen_temperature: float = 0.5
     lambda_state_consistency: float = 1.0
     lambda_proto_pull: float = 1.0
     lambda_proto_repulsion: float = 1.0
@@ -181,7 +181,7 @@ _COMMON_EXPLICIT: Dict[str, object] = {
     "state_dim": 0,
     "num_prototypes": 0,
     "proto_temperature": 0.2,
-    "q_cons_sharpen_temperature": 0.5,
+    "q_joint_sharpen_temperature": 0.5,
     "lambda_state_consistency": 1.0,
     "lambda_proto_pull": 1.0,
     "lambda_proto_repulsion": 1.0,
@@ -408,7 +408,7 @@ _STAGE2_METHOD_DEFAULTS: Dict[str, Dict[str, object]] = {
     "separate_proto": {
         "lambda_state_consistency": 0.05,
         "lambda_proto_pull": 0.2,
-        "q_cons_sharpen_temperature": 1.0,
+        "q_joint_sharpen_temperature": 1.0,
         "lambda_proto_usage_balance": 0.05,
         "stage2_balanced_core": True,
         "stage2_balanced_core_max_fraction": 0.35,
@@ -419,24 +419,8 @@ _STAGE2_METHOD_DEFAULTS: Dict[str, Dict[str, object]] = {
 
 def _normalize_stage2_method(method: object) -> str:
     normalized = str(method or "separate_proto").strip().lower()
-    aliases = {
-        "prototype": "separate_proto",
-        "consensus": "separate_proto",
-        "consensus_proto": "separate_proto",
-        "consensus_proto_v2": "separate_proto",
-        "consensus_proto_balanced": "separate_proto",
-        "balanced_consensus_proto": "separate_proto",
-        "paired": "separate_proto",
-        "paired_proto": "separate_proto",
-        "paired_prototype": "separate_proto",
-        "separate": "separate_proto",
-        "separate_prototype": "separate_proto",
-    }
-    normalized = aliases.get(normalized, normalized)
-    if normalized in {"shared_proto", "shared_prototype", "common_proto", "common_prototype"}:
-        raise ValueError("Shared/common prototype mode has been removed. Use 'separate_proto'.")
     if normalized != "separate_proto":
-        raise ValueError("stage2_method should be 'separate_proto'.")
+        raise ValueError("Only stage2_method='separate_proto' is supported.")
     return normalized
 
 
