@@ -37,11 +37,15 @@ class TimeSeriesAnomalyInjector:
         self.p_shapelet = p_shapelet / total
         self.p_relational = p_relational / total
 
-    def __call__(self, x_window: Union[np.ndarray, torch.Tensor]) -> Union[np.ndarray, torch.Tensor]:
+    def __call__(
+        self,
+        x_window: Union[np.ndarray, torch.Tensor],
+        return_mask: bool = False,
+    ) -> Union[np.ndarray, torch.Tensor]:
         if isinstance(x_window, torch.Tensor):
-            return self._inject_tensor(x_window)
+            return self._inject_tensor(x_window, return_mask=return_mask)
         if isinstance(x_window, np.ndarray):
-            return self._inject_numpy(x_window)
+            return self._inject_numpy(x_window, return_mask=return_mask)
         raise TypeError("x_window must be a numpy.ndarray or torch.Tensor.")
 
     def _choose_mode(self) -> str:
@@ -78,45 +82,77 @@ class TimeSeriesAnomalyInjector:
         num_dims = random.randint(1, max_dims)
         return random.sample(range(num_channels), num_dims)
 
-    def _inject_tensor(self, x_window: torch.Tensor) -> torch.Tensor:
+    def _inject_tensor(self, x_window: torch.Tensor, return_mask: bool = False) -> torch.Tensor:
+        if x_window.dim() == 3:
+            injected = []
+            masks = []
+            for sample in x_window:
+                sample_injected, sample_mask = self._inject_tensor(sample, return_mask=True)
+                injected.append(sample_injected)
+                masks.append(sample_mask)
+            x_out = torch.stack(injected, dim=0)
+            mask_out = torch.stack(masks, dim=0)
+            return (x_out, mask_out) if return_mask else x_out
+
         x = x_window.detach().clone()
         if x.dim() != 2:
-            raise ValueError(f"Expected input shape [C, L], got {tuple(x.shape)}")
+            raise ValueError(f"Expected input shape [C, L] or [B, C, L], got {tuple(x.shape)}")
 
+        mask = torch.zeros_like(x, dtype=torch.bool)
         mode = self._choose_mode()
         if mode == "spike":
-            return self._add_spike_tensor(x)
+            return self._add_spike_tensor(x, mask, return_mask=return_mask)
         if mode == "shift":
-            return self._add_shift_tensor(x)
+            return self._add_shift_tensor(x, mask, return_mask=return_mask)
         if mode == "scale":
-            return self._add_scale_tensor(x)
+            return self._add_scale_tensor(x, mask, return_mask=return_mask)
         if mode == "trend":
-            return self._add_trend_tensor(x)
+            return self._add_trend_tensor(x, mask, return_mask=return_mask)
         if mode == "contextual":
-            return self._add_contextual_tensor(x)
+            return self._add_contextual_tensor(x, mask, return_mask=return_mask)
         if mode == "relational":
-            return self._add_relational_tensor(x)
-        return self._add_shapelet_tensor(x)
+            return self._add_relational_tensor(x, mask, return_mask=return_mask)
+        return self._add_shapelet_tensor(x, mask, return_mask=return_mask)
 
-    def _inject_numpy(self, x_window: np.ndarray) -> np.ndarray:
+    def _inject_numpy(self, x_window: np.ndarray, return_mask: bool = False) -> np.ndarray:
+        if x_window.ndim == 3:
+            injected = []
+            masks = []
+            for sample in x_window:
+                sample_injected, sample_mask = self._inject_numpy(sample, return_mask=True)
+                injected.append(sample_injected)
+                masks.append(sample_mask)
+            x_out = np.stack(injected, axis=0)
+            mask_out = np.stack(masks, axis=0)
+            return (x_out, mask_out) if return_mask else x_out
+
         x = np.array(x_window, copy=True)
         if x.ndim != 2:
-            raise ValueError(f"Expected input shape [C, L], got {x.shape}")
+            raise ValueError(f"Expected input shape [C, L] or [B, C, L], got {x.shape}")
 
+        mask = np.zeros_like(x, dtype=bool)
         mode = self._choose_mode()
         if mode == "spike":
-            return self._add_spike_numpy(x)
+            return self._add_spike_numpy(x, mask, return_mask=return_mask)
         if mode == "shift":
-            return self._add_shift_numpy(x)
+            return self._add_shift_numpy(x, mask, return_mask=return_mask)
         if mode == "scale":
-            return self._add_scale_numpy(x)
+            return self._add_scale_numpy(x, mask, return_mask=return_mask)
         if mode == "trend":
-            return self._add_trend_numpy(x)
+            return self._add_trend_numpy(x, mask, return_mask=return_mask)
         if mode == "contextual":
-            return self._add_contextual_numpy(x)
+            return self._add_contextual_numpy(x, mask, return_mask=return_mask)
         if mode == "relational":
-            return self._add_relational_numpy(x)
-        return self._add_shapelet_numpy(x)
+            return self._add_relational_numpy(x, mask, return_mask=return_mask)
+        return self._add_shapelet_numpy(x, mask, return_mask=return_mask)
+
+    @staticmethod
+    def _finish_tensor(x: torch.Tensor, mask: torch.Tensor, return_mask: bool):
+        return (x, mask) if return_mask else x
+
+    @staticmethod
+    def _finish_numpy(x: np.ndarray, mask: np.ndarray, return_mask: bool):
+        return (x, mask) if return_mask else x
 
     def inject_relational_batch(
         self,
@@ -134,9 +170,9 @@ class TimeSeriesAnomalyInjector:
 
         x = x_batch.detach().clone()
         bsz, num_channels, length = x.shape
-        valid_mask = torch.zeros(bsz, device=x.device, dtype=torch.bool)
+        point_mask = torch.zeros_like(x, dtype=torch.bool)
         if bsz <= 0 or num_channels <= 0 or length <= 1:
-            return (x, valid_mask) if return_mask else x
+            return (x, point_mask) if return_mask else x
 
         p = min(max(float(p), 0.0), 1.0)
         max_selected_channels = int(max_channels)
@@ -191,11 +227,11 @@ class TimeSeriesAnomalyInjector:
                         random.shuffle(permuted)
                     x[batch_idx, channels, :] = x_batch[batch_idx, permuted, :]
 
-            valid_mask[batch_idx] = True
+            point_mask[batch_idx, channels, :] = True
 
-        return (x, valid_mask) if return_mask else x
+        return (x, point_mask) if return_mask else x
 
-    def _add_spike_tensor(self, x: torch.Tensor) -> torch.Tensor:
+    def _add_spike_tensor(self, x: torch.Tensor, mask: torch.Tensor, return_mask: bool = False) -> torch.Tensor:
         c, l = x.shape
         num_points = random.randint(1, max(1, l // 10))
         std = x.std(unbiased=False).clamp_min(1e-6)
@@ -206,26 +242,29 @@ class TimeSeriesAnomalyInjector:
             pos = random.randrange(l)
             sign = 1.0 if random.random() > 0.5 else -1.0
             x[ch, pos] = x[ch, pos] + sign * amplitude
-        return x
+            mask[ch, pos] = True
+        return self._finish_tensor(x, mask, return_mask)
 
-    def _add_shift_tensor(self, x: torch.Tensor) -> torch.Tensor:
+    def _add_shift_tensor(self, x: torch.Tensor, mask: torch.Tensor, return_mask: bool = False) -> torch.Tensor:
         dims, l = x.shape
         start, end = self._sample_segment(l, min_ratio=0.1, max_ratio=0.35)
         target_dims = self._sample_dims(dims)
         std = x.std(unbiased=False).clamp_min(1e-6)
         offset = random.uniform(-3.0, 3.0) * std
         x[target_dims, start:end] = x[target_dims, start:end] + offset
-        return x
+        mask[target_dims, start:end] = True
+        return self._finish_tensor(x, mask, return_mask)
 
-    def _add_scale_tensor(self, x: torch.Tensor) -> torch.Tensor:
+    def _add_scale_tensor(self, x: torch.Tensor, mask: torch.Tensor, return_mask: bool = False) -> torch.Tensor:
         dims, l = x.shape
         start, end = self._sample_segment(l, min_ratio=0.12, max_ratio=0.5)
         target_dims = self._sample_dims(dims)
         scale = random.choice([random.uniform(1.5, 2.5), random.uniform(0.2, 0.7)])
         x[target_dims, start:end] = x[target_dims, start:end] * scale
-        return x
+        mask[target_dims, start:end] = True
+        return self._finish_tensor(x, mask, return_mask)
 
-    def _add_trend_tensor(self, x: torch.Tensor) -> torch.Tensor:
+    def _add_trend_tensor(self, x: torch.Tensor, mask: torch.Tensor, return_mask: bool = False) -> torch.Tensor:
         dims, l = x.shape
         start, end = self._sample_segment(l, min_ratio=0.25, max_ratio=0.9)
         if random.random() < 0.5:
@@ -237,9 +276,10 @@ class TimeSeriesAnomalyInjector:
         sign = 1.0 if random.random() > 0.5 else -1.0
         ramp = torch.linspace(0.0, 1.0, steps=seg_len, device=x.device, dtype=x.dtype)
         x[target_dims, start:end] = x[target_dims, start:end] + sign * base * ramp.unsqueeze(0)
-        return x
+        mask[target_dims, start:end] = True
+        return self._finish_tensor(x, mask, return_mask)
 
-    def _add_contextual_tensor(self, x: torch.Tensor) -> torch.Tensor:
+    def _add_contextual_tensor(self, x: torch.Tensor, mask: torch.Tensor, return_mask: bool = False) -> torch.Tensor:
         dims, l = x.shape
         start, end = self._sample_segment(l, min_ratio=0.08, max_ratio=0.2)
         target_dims = self._sample_dims(dims, full_prob=0.2)
@@ -247,9 +287,10 @@ class TimeSeriesAnomalyInjector:
         offset = random.uniform(-2.5, 2.5) * std
         local_scale = random.uniform(1.5, 2.2)
         x[target_dims, start:end] = x[target_dims, start:end] * local_scale + offset
-        return x
+        mask[target_dims, start:end] = True
+        return self._finish_tensor(x, mask, return_mask)
 
-    def _add_shapelet_tensor(self, x: torch.Tensor) -> torch.Tensor:
+    def _add_shapelet_tensor(self, x: torch.Tensor, mask: torch.Tensor, return_mask: bool = False) -> torch.Tensor:
         dims, l = x.shape
         start, end = self._sample_segment(l, min_ratio=0.15, max_ratio=0.5)
         target_dims = self._sample_dims(dims, full_prob=0.2)
@@ -258,12 +299,13 @@ class TimeSeriesAnomalyInjector:
         std = x.std(unbiased=False).clamp_min(1e-6)
         noise = torch.randn_like(base) * (0.05 * std)
         x[target_dims, start:end] = base + noise
-        return x
+        mask[target_dims, start:end] = True
+        return self._finish_tensor(x, mask, return_mask)
 
-    def _add_relational_tensor(self, x: torch.Tensor) -> torch.Tensor:
+    def _add_relational_tensor(self, x: torch.Tensor, mask: torch.Tensor, return_mask: bool = False) -> torch.Tensor:
         dims, l = x.shape
         if dims <= 0 or l <= 1:
-            return x
+            return self._finish_tensor(x, mask, return_mask)
         mode = random.choice(["time_shift", "channel_shuffle"])
         target_dims = self._sample_dims(dims, full_prob=0.0)
         if mode == "time_shift" or dims == 1:
@@ -272,7 +314,8 @@ class TimeSeriesAnomalyInjector:
             if random.random() < 0.5:
                 shift = -shift
             x[target_dims, :] = torch.roll(x[target_dims, :], shifts=shift, dims=-1)
-            return x
+            mask[target_dims, :] = True
+            return self._finish_tensor(x, mask, return_mask)
 
         if len(target_dims) < 2:
             target_dims = random.sample(range(dims), min(2, dims))
@@ -280,9 +323,10 @@ class TimeSeriesAnomalyInjector:
         while permuted == target_dims:
             random.shuffle(permuted)
         x[target_dims, :] = x[permuted, :].clone()
-        return x
+        mask[target_dims, :] = True
+        return self._finish_tensor(x, mask, return_mask)
 
-    def _add_spike_numpy(self, x: np.ndarray) -> np.ndarray:
+    def _add_spike_numpy(self, x: np.ndarray, mask: np.ndarray, return_mask: bool = False) -> np.ndarray:
         c, l = x.shape
         num_points = random.randint(1, max(1, l // 10))
         std = max(float(x.std()), 1e-6)
@@ -293,26 +337,29 @@ class TimeSeriesAnomalyInjector:
             pos = random.randrange(l)
             sign = 1.0 if random.random() > 0.5 else -1.0
             x[ch, pos] = x[ch, pos] + sign * amplitude
-        return x
+            mask[ch, pos] = True
+        return self._finish_numpy(x, mask, return_mask)
 
-    def _add_shift_numpy(self, x: np.ndarray) -> np.ndarray:
+    def _add_shift_numpy(self, x: np.ndarray, mask: np.ndarray, return_mask: bool = False) -> np.ndarray:
         dims, l = x.shape
         start, end = self._sample_segment(l, min_ratio=0.1, max_ratio=0.35)
         target_dims = self._sample_dims(dims)
         std = max(float(x.std()), 1e-6)
         offset = random.uniform(-3.0, 3.0) * std
         x[target_dims, start:end] = x[target_dims, start:end] + offset
-        return x
+        mask[target_dims, start:end] = True
+        return self._finish_numpy(x, mask, return_mask)
 
-    def _add_scale_numpy(self, x: np.ndarray) -> np.ndarray:
+    def _add_scale_numpy(self, x: np.ndarray, mask: np.ndarray, return_mask: bool = False) -> np.ndarray:
         dims, l = x.shape
         start, end = self._sample_segment(l, min_ratio=0.12, max_ratio=0.5)
         target_dims = self._sample_dims(dims)
         scale = random.choice([random.uniform(1.5, 2.5), random.uniform(0.2, 0.7)])
         x[target_dims, start:end] = x[target_dims, start:end] * scale
-        return x
+        mask[target_dims, start:end] = True
+        return self._finish_numpy(x, mask, return_mask)
 
-    def _add_trend_numpy(self, x: np.ndarray) -> np.ndarray:
+    def _add_trend_numpy(self, x: np.ndarray, mask: np.ndarray, return_mask: bool = False) -> np.ndarray:
         dims, l = x.shape
         start, end = self._sample_segment(l, min_ratio=0.25, max_ratio=0.9)
         if random.random() < 0.5:
@@ -324,9 +371,10 @@ class TimeSeriesAnomalyInjector:
         sign = 1.0 if random.random() > 0.5 else -1.0
         ramp = np.linspace(0.0, 1.0, num=seg_len, dtype=x.dtype)
         x[target_dims, start:end] = x[target_dims, start:end] + sign * base * ramp[None, :]
-        return x
+        mask[target_dims, start:end] = True
+        return self._finish_numpy(x, mask, return_mask)
 
-    def _add_contextual_numpy(self, x: np.ndarray) -> np.ndarray:
+    def _add_contextual_numpy(self, x: np.ndarray, mask: np.ndarray, return_mask: bool = False) -> np.ndarray:
         dims, l = x.shape
         start, end = self._sample_segment(l, min_ratio=0.08, max_ratio=0.2)
         target_dims = self._sample_dims(dims, full_prob=0.2)
@@ -334,9 +382,10 @@ class TimeSeriesAnomalyInjector:
         offset = random.uniform(-2.5, 2.5) * std
         local_scale = random.uniform(1.5, 2.2)
         x[target_dims, start:end] = x[target_dims, start:end] * local_scale + offset
-        return x
+        mask[target_dims, start:end] = True
+        return self._finish_numpy(x, mask, return_mask)
 
-    def _add_shapelet_numpy(self, x: np.ndarray) -> np.ndarray:
+    def _add_shapelet_numpy(self, x: np.ndarray, mask: np.ndarray, return_mask: bool = False) -> np.ndarray:
         dims, l = x.shape
         start, end = self._sample_segment(l, min_ratio=0.15, max_ratio=0.5)
         target_dims = self._sample_dims(dims, full_prob=0.2)
@@ -345,12 +394,13 @@ class TimeSeriesAnomalyInjector:
         std = max(float(x.std()), 1e-6)
         noise = np.random.randn(*base.shape).astype(x.dtype, copy=False) * (0.05 * std)
         x[target_dims, start:end] = base + noise
-        return x
+        mask[target_dims, start:end] = True
+        return self._finish_numpy(x, mask, return_mask)
 
-    def _add_relational_numpy(self, x: np.ndarray) -> np.ndarray:
+    def _add_relational_numpy(self, x: np.ndarray, mask: np.ndarray, return_mask: bool = False) -> np.ndarray:
         dims, l = x.shape
         if dims <= 0 or l <= 1:
-            return x
+            return self._finish_numpy(x, mask, return_mask)
         mode = random.choice(["time_shift", "channel_shuffle"])
         target_dims = self._sample_dims(dims, full_prob=0.0)
         if mode == "time_shift" or dims == 1:
@@ -359,7 +409,8 @@ class TimeSeriesAnomalyInjector:
             if random.random() < 0.5:
                 shift = -shift
             x[target_dims, :] = np.roll(x[target_dims, :], shift=shift, axis=-1)
-            return x
+            mask[target_dims, :] = True
+            return self._finish_numpy(x, mask, return_mask)
 
         if len(target_dims) < 2:
             target_dims = random.sample(range(dims), min(2, dims))
@@ -367,4 +418,5 @@ class TimeSeriesAnomalyInjector:
         while permuted == target_dims:
             random.shuffle(permuted)
         x[target_dims, :] = x[permuted, :].copy()
-        return x
+        mask[target_dims, :] = True
+        return self._finish_numpy(x, mask, return_mask)

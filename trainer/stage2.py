@@ -14,10 +14,10 @@ from utils.losses import (
     joint_teacher_distribution,
     js_divergence,
     prototype_usage_balance_loss,
-    prototype_repulsion_loss,
     prototype_separation_loss,
     state_consistency_teacher_loss,
 )
+from utils.patch_mask import point_mask_to_patch_mask
 
 
 __all__ = [
@@ -36,6 +36,7 @@ __all__ = [
     "_refresh_separate_joint_core",
     "_build_stage2_separate_loader",
     "_separate_prototype_relation_loss",
+    "_inject_stage2_negative_batch_with_mask",
     "_separate_proto_batch_loss",
     "_stage2_separate_proto_epoch",
     "_run_stage2_separate_proto_refinement",
@@ -101,18 +102,43 @@ def _collect_separate_view_state_features(self, loader: DataLoader) -> Tuple[np.
     with torch.inference_mode():
         for batch in loader:
             x = self._prepare_batch(batch)
-            z1, z2 = self.model.encode_views(x)
-            u1, u2 = self.model.state_from_views(z1, z2)
-            features_v1.append(u1.detach().cpu().numpy())
-            features_v2.append(u2.detach().cpu().numpy())
+            outputs = self.model(x, stage="stage2")
+            u1_token = outputs["u1_token"]
+            u2_token = outputs["u2_token"]
+            features_v1.append(u1_token.reshape(-1, u1_token.size(-1)).detach().cpu().numpy())
+            features_v2.append(u2_token.reshape(-1, u2_token.size(-1)).detach().cpu().numpy())
     if was_training:
         self.model.train()
     if not features_v1 or not features_v2:
-        raise RuntimeError("No windows were available for separate prototype initialization.")
-    return (
-        np.concatenate(features_v1, axis=0).astype(np.float32),
-        np.concatenate(features_v2, axis=0).astype(np.float32),
+        raise RuntimeError("No token features were available for separate prototype initialization.")
+
+    features_v1 = np.concatenate(features_v1, axis=0).astype(np.float32)
+    features_v2 = np.concatenate(features_v2, axis=0).astype(np.float32)
+    if features_v1.shape[0] != features_v2.shape[0]:
+        raise RuntimeError(
+            "View token feature counts should match for token-level prototype initialization. "
+            f"v1={features_v1.shape[0]}, v2={features_v2.shape[0]}"
+        )
+
+    total_tokens = int(features_v1.shape[0])
+    max_tokens = int(getattr(self.config, "stage2_token_kmeans_max_tokens", 200000))
+    sampled_tokens = total_tokens
+    if max_tokens > 0 and total_tokens > max_tokens:
+        rng = np.random.default_rng(int(getattr(self.config, "seed", 42)))
+        indices = rng.choice(total_tokens, size=max_tokens, replace=False)
+        indices.sort()
+        features_v1 = features_v1[indices]
+        features_v2 = features_v2[indices]
+        sampled_tokens = int(max_tokens)
+
+    print(
+        "[Stage2-TokenProto] token KMeans features | "
+        f"h1_token_features={tuple(features_v1.shape)} | "
+        f"h2_token_features={tuple(features_v2.shape)} | "
+        f"total_tokens={total_tokens} | "
+        f"sampled_tokens={sampled_tokens}"
     )
+    return features_v1, features_v2
 
 
 def _build_separate_joint_kmeans_features(
@@ -154,6 +180,12 @@ def _collect_separate_proto_outputs(self, loader: DataLoader) -> Dict[str, np.nd
         "conf2": [],
         "recon1": [],
         "recon2": [],
+        "proto_dist1_token_mean": [],
+        "proto_dist1_token_max": [],
+        "proto_dist2_token_mean": [],
+        "proto_dist2_token_max": [],
+        "token_conf1_mean": [],
+        "token_conf2_mean": [],
     }
     with torch.inference_mode():
         for batch in loader:
@@ -172,6 +204,12 @@ def _collect_separate_proto_outputs(self, loader: DataLoader) -> Dict[str, np.nd
                 conf2 = outputs["proto_conf2"]
                 recon1 = self._mse_per_sample(x, outputs["x_hat1"], view="v1")
                 recon2 = self._mse_per_sample(x, outputs["x_hat2"], view="v2")
+                proto_dist1_token_mean = outputs["proto_dist1_token"].reshape(outputs["proto_dist1_token"].size(0), -1).mean(dim=1)
+                proto_dist1_token_max = outputs["proto_dist1_token"].reshape(outputs["proto_dist1_token"].size(0), -1).max(dim=1).values
+                proto_dist2_token_mean = outputs["proto_dist2_token"].reshape(outputs["proto_dist2_token"].size(0), -1).mean(dim=1)
+                proto_dist2_token_max = outputs["proto_dist2_token"].reshape(outputs["proto_dist2_token"].size(0), -1).max(dim=1).values
+                token_conf1_mean = outputs["proto_conf1_token"].reshape(outputs["proto_conf1_token"].size(0), -1).mean(dim=1)
+                token_conf2_mean = outputs["proto_conf2_token"].reshape(outputs["proto_conf2_token"].size(0), -1).mean(dim=1)
                 if self._uses_separate_prototypes():
                     u_joint = F.normalize(torch.cat([u1, u2], dim=1), dim=1)
                 else:
@@ -190,6 +228,12 @@ def _collect_separate_proto_outputs(self, loader: DataLoader) -> Dict[str, np.nd
                 recon = self._mse_per_sample(x, outputs["x_hat"], view=self._normalize_reconstruction_view())
                 recon1 = recon
                 recon2 = recon
+                proto_dist1_token_mean = proto_dist1
+                proto_dist1_token_max = proto_dist1
+                proto_dist2_token_mean = proto_dist2
+                proto_dist2_token_max = proto_dist2
+                token_conf1_mean = conf1
+                token_conf2_mean = conf2
                 u_joint = F.normalize(u1, dim=1)
             collected["u1"].append(u1.detach().cpu().numpy())
             collected["u2"].append(u2.detach().cpu().numpy())
@@ -204,6 +248,12 @@ def _collect_separate_proto_outputs(self, loader: DataLoader) -> Dict[str, np.nd
             collected["conf2"].append(conf2.detach().cpu().numpy())
             collected["recon1"].append(recon1.detach().cpu().numpy())
             collected["recon2"].append(recon2.detach().cpu().numpy())
+            collected["proto_dist1_token_mean"].append(proto_dist1_token_mean.detach().cpu().numpy())
+            collected["proto_dist1_token_max"].append(proto_dist1_token_max.detach().cpu().numpy())
+            collected["proto_dist2_token_mean"].append(proto_dist2_token_mean.detach().cpu().numpy())
+            collected["proto_dist2_token_max"].append(proto_dist2_token_max.detach().cpu().numpy())
+            collected["token_conf1_mean"].append(token_conf1_mean.detach().cpu().numpy())
+            collected["token_conf2_mean"].append(token_conf2_mean.detach().cpu().numpy())
     if was_training:
         self.model.train()
     result: Dict[str, np.ndarray] = {}
@@ -245,11 +295,11 @@ def _initialize_separate_prototypes(self):
 
     self.model.init_separate_prototypes_from_centers(centers_v1, centers_v2)
     print(
-        "[Stage2-Separate] initialized separate prototypes | "
+        "[Stage2-TokenProto] initialized token-level separate prototypes | "
         f"cluster_actual={cluster_meta.get('cluster_method_actual', 'kmeans')} | "
-        "init=joint_kmeans_l2_zscore | "
+        "init=token_joint_kmeans_l2_zscore | "
         f"K={int(num_prototypes)} | "
-        f"state_dim={int(centers_v1.shape[1])} | "
+        f"D={int(centers_v1.shape[1])} | "
         f"temperature={float(getattr(self.config, 'proto_temperature', 0.2)):.4f}"
     )
     self._refresh_separate_joint_core(round_idx=0)
@@ -576,6 +626,33 @@ def _separate_prototype_relation_loss(
     return F.mse_loss(sim1[mask], sim2[mask])
 
 
+def _inject_stage2_negative_batch_with_mask(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    if self._use_relational_batch_negative("stage2"):
+        x_negative, point_mask = self.injector.inject_relational_batch(
+            x.detach(),
+            p=float(getattr(self.config, "stage2_relational_negative_p", 1.0)),
+            max_shift_ratio=float(getattr(self.config, "stage2_relational_max_shift_ratio", 0.10)),
+            max_channels=int(getattr(self.config, "stage2_relational_max_channels", 0)),
+            mode_weights=self._relational_mode_weights(),
+            return_mask=True,
+        )
+        return (
+            x_negative.to(device=x.device, dtype=x.dtype),
+            point_mask.to(device=x.device, dtype=torch.bool),
+        )
+
+    injected = []
+    masks = []
+    for sample in x.detach():
+        sample_injected, sample_mask = self.injector(sample, return_mask=True)
+        injected.append(sample_injected)
+        masks.append(sample_mask)
+    return (
+        torch.stack(injected, dim=0).to(device=x.device, dtype=x.dtype),
+        torch.stack(masks, dim=0).to(device=x.device, dtype=torch.bool),
+    )
+
+
 def _separate_proto_batch_loss(self, raw_batch) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     if not hasattr(self, "separate_joint_core_mask"):
         raise RuntimeError("Separate prototype joint core has not been initialized.")
@@ -624,7 +701,23 @@ def _separate_proto_batch_loss(self, raw_batch) -> Tuple[torch.Tensor, Dict[str,
     else:
         loss_state = self._zero_stage2_loss()
 
-    if torch.any(batch_core):
+    js_token = self._zero_stage2_loss()
+    if use_separate:
+        q1_token = outputs["q1_token"]
+        q2_token = outputs["q2_token"]
+        js_token = js_divergence(
+            q1_token.reshape(-1, q1_token.size(-1)),
+            q2_token.reshape(-1, q2_token.size(-1)),
+            eps=float(getattr(self.config, "robust_eps", 1e-8)),
+        ).mean()
+        if torch.any(batch_core):
+            token_core_mask = batch_core[:, None, None].expand_as(outputs["proto_dist1_token"])
+            pull1 = outputs["proto_dist1_token"][token_core_mask].mean()
+            pull2 = outputs["proto_dist2_token"][token_core_mask].mean()
+            loss_pull = 0.5 * (pull1 + pull2)
+        else:
+            loss_pull = self._zero_stage2_loss()
+    elif torch.any(batch_core):
         q1_core = outputs["q1"][batch_core]
         q2_core = outputs["q2"][batch_core]
         q_teacher = joint_teacher_distribution(
@@ -633,15 +726,7 @@ def _separate_proto_batch_loss(self, raw_batch) -> Tuple[torch.Tensor, Dict[str,
             sharpen_temperature=float(getattr(self.config, "q_joint_sharpen_temperature", 0.5)),
         )
         target = torch.argmax(q_teacher, dim=1)
-        if use_separate:
-            target1 = target.long().clamp(0, self.model.prototype_head_v1.prototypes.size(0) - 1)
-            target2 = target.long().clamp(0, self.model.prototype_head_v2.prototypes.size(0) - 1)
-            proto1 = self.model.prototype_head_v1.prototypes[target1]
-            proto2 = self.model.prototype_head_v2.prototypes[target2]
-            pull1 = torch.sum((outputs["u1"][batch_core] - proto1) ** 2, dim=1)
-            pull2 = torch.sum((outputs["u2"][batch_core] - proto2) ** 2, dim=1)
-            loss_pull = 0.5 * (pull1 + pull2).mean()
-        else:
+        if not use_separate:
             target_single = target.long().clamp(0, self.model.prototype_head.prototypes.size(0) - 1)
             proto = self.model.prototype_head.prototypes[target_single]
             pull1 = torch.sum((outputs["u1"][batch_core] - proto) ** 2, dim=1)
@@ -651,23 +736,41 @@ def _separate_proto_batch_loss(self, raw_batch) -> Tuple[torch.Tensor, Dict[str,
         loss_pull = self._zero_stage2_loss()
 
     lambda_repulsion = float(getattr(self.config, "lambda_proto_repulsion", 1.0))
-    if lambda_repulsion != 0.0:
-        x_negative = self._inject_stage1_negative_batch(x, stage="stage2")
-        neg_outputs = self.model(x_negative, stage="stage2")
-        if not self._is_dual_view_model():
-            neg_outputs = dict(neg_outputs)
-            neg_outputs["u1"] = neg_outputs["u"]
-            neg_outputs["u2"] = neg_outputs["u"]
-        margin = float(getattr(self.config, "proto_repulsion_margin", 1.0))
-        if use_separate:
-            rep1 = prototype_repulsion_loss(neg_outputs["u1"], self.model.prototype_head_v1.prototypes, margin)
-            rep2 = prototype_repulsion_loss(neg_outputs["u2"], self.model.prototype_head_v2.prototypes, margin)
-        else:
-            rep1 = prototype_repulsion_loss(neg_outputs["u1"], self.model.prototype_head.prototypes, margin)
-            rep2 = prototype_repulsion_loss(neg_outputs["u2"], self.model.prototype_head.prototypes, margin)
-        loss_repulsion = 0.5 * (rep1 + rep2)
-    else:
-        loss_repulsion = self._zero_stage2_loss()
+    loss_repulsion = self._zero_stage2_loss()
+    lambda_injected_push = float(getattr(self.config, "lambda_injected_push", 0.1))
+    loss_push_injected = self._zero_stage2_loss()
+    injected_patch_ratio = self._zero_stage2_loss()
+    injected_dist_mean_before_margin = self._zero_stage2_loss()
+    if use_separate and lambda_injected_push != 0.0:
+        x_negative, inj_point_mask = self._inject_stage2_negative_batch_with_mask(x)
+        neg_outputs = self.model(x_negative, stage="stage2", detach_prototypes=True)
+        inj_patch_mask = point_mask_to_patch_mask(
+            inj_point_mask,
+            patch_len=int(getattr(self.model, "patch_len", getattr(self.config, "patch_len", 16))),
+            patch_stride=int(getattr(self.model, "patch_stride", getattr(self.config, "patch_stride", 8))),
+        ).to(device=self.device, dtype=torch.bool)
+        if inj_patch_mask.shape != neg_outputs["proto_dist1_token"].shape:
+            raise RuntimeError(
+                "Injected patch mask should align with token prototype distances. "
+                f"mask={tuple(inj_patch_mask.shape)}, dist={tuple(neg_outputs['proto_dist1_token'].shape)}"
+            )
+        injected_patch_ratio = inj_patch_mask.float().mean()
+        if bool(inj_patch_mask.any()):
+            margin = float(
+                getattr(
+                    self.config,
+                    "stage2_injected_margin",
+                    getattr(self.config, "proto_repulsion_margin", 1.0),
+                )
+            )
+            if margin <= 0.0:
+                margin = float(getattr(self.config, "proto_repulsion_margin", 1.0))
+            dist1_neg = neg_outputs["proto_dist1_token"][inj_patch_mask]
+            dist2_neg = neg_outputs["proto_dist2_token"][inj_patch_mask]
+            injected_dist_mean_before_margin = 0.5 * (dist1_neg.mean() + dist2_neg.mean())
+            push1 = F.relu(float(margin) - dist1_neg).pow(2).mean()
+            push2 = F.relu(float(margin) - dist2_neg).pow(2).mean()
+            loss_push_injected = 0.5 * (push1 + push2)
 
     lambda_separation = float(getattr(self.config, "lambda_proto_separation", 0.3))
     if lambda_separation != 0.0:
@@ -740,13 +843,20 @@ def _separate_proto_batch_loss(self, raw_batch) -> Tuple[torch.Tensor, Dict[str,
         + lambda_separation * loss_proto_separation
         + lambda_usage_balance * loss_usage_balance
         + lambda_relation * loss_proto_relation
+        + lambda_injected_push * loss_push_injected
         + float(getattr(self.config, "stage2_lambda_rec", 0.0)) * loss_rec
     )
     return loss, {
         "loss": loss,
         "loss_state": loss_state,
+        "js_token": js_token,
         "loss_pull": loss_pull,
+        "L_pull_normal": loss_pull,
         "loss_repulsion": loss_repulsion,
+        "loss_push_injected": loss_push_injected,
+        "L_push_injected": loss_push_injected,
+        "injected_patch_ratio": injected_patch_ratio,
+        "injected_dist_mean_before_margin": injected_dist_mean_before_margin,
         "loss_proto_separation": loss_proto_separation,
         "loss_usage_balance": loss_usage_balance,
         "loss_proto_relation": loss_proto_relation,
@@ -770,8 +880,14 @@ def _stage2_separate_proto_epoch(
     totals = {
         "loss": 0.0,
         "loss_state": 0.0,
+        "js_token": 0.0,
         "loss_pull": 0.0,
+        "L_pull_normal": 0.0,
         "loss_repulsion": 0.0,
+        "loss_push_injected": 0.0,
+        "L_push_injected": 0.0,
+        "injected_patch_ratio": 0.0,
+        "injected_dist_mean_before_margin": 0.0,
         "loss_proto_separation": 0.0,
         "loss_usage_balance": 0.0,
         "loss_proto_relation": 0.0,
@@ -797,8 +913,9 @@ def _stage2_separate_proto_epoch(
             {
                 "loss": f"{loss.item():.4f}",
                 "state": f"{batch_losses['loss_state'].item():.4f}",
+                "js_tok": f"{batch_losses['js_token'].item():.4f}",
                 "pull": f"{batch_losses['loss_pull'].item():.4f}",
-                "rep": f"{batch_losses['loss_repulsion'].item():.4f}",
+                "push": f"{batch_losses['loss_push_injected'].item():.4f}",
                 "sep": f"{batch_losses['loss_proto_separation'].item():.4f}",
                 "bal": f"{batch_losses['loss_usage_balance'].item():.4f}",
                 "rel": f"{batch_losses['loss_proto_relation'].item():.4f}",
@@ -815,7 +932,13 @@ def _stage2_separate_proto_epoch(
             "joint_core": int(np.sum(getattr(self, "separate_joint_core_mask", np.zeros(0, dtype=bool)))),
             "loss": totals["loss"] / denom,
             "loss_state": totals["loss_state"] / denom,
+            "js_token": totals["js_token"] / denom,
             "loss_pull": totals["loss_pull"] / denom,
+            "L_pull_normal": totals["L_pull_normal"] / denom,
+            "loss_push_injected": totals["loss_push_injected"] / denom,
+            "L_push_injected": totals["L_push_injected"] / denom,
+            "injected_patch_ratio": totals["injected_patch_ratio"] / denom,
+            "injected_dist_mean_before_margin": totals["injected_dist_mean_before_margin"] / denom,
             "loss_repulsion": totals["loss_repulsion"] / denom,
             "loss_proto_separation": totals["loss_proto_separation"] / denom,
             "loss_usage_balance": totals["loss_usage_balance"] / denom,

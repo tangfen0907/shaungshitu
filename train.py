@@ -25,74 +25,7 @@ def _collect_cli_overrides(args: argparse.Namespace, keys) -> Dict[str, object]:
 
 
 def parse_common_preset_args(description: str) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=description)
-    parser.add_argument("--data_path", type=str, default=None)
-    parser.add_argument("--train_split_mode", type=str, default=None)
-    parser.add_argument("--test_split_mode", type=str, default=None)
-    parser.add_argument("--scaler_fit_mode", type=str, default=None)
-    parser.add_argument("--visualization_method", choices=["pca", "tsne", "umap"], default=None)
-    parser.add_argument("--enable_stage1_recon_scoring", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--tcn_layers", type=_parse_tcn_layers, default=None)
-    parser.add_argument("--latent_dim", type=int, default=None)
-    parser.add_argument("--v2_first_kernel_size", type=int, default=None)
-    parser.add_argument("--readout_mode", choices=["attn_topk_max", "attention", "attn", "last", "topk_max"], default=None)
-    parser.add_argument("--topk_ratio", type=float, default=None)
-    parser.add_argument("--topk_k", type=int, default=None)
-    parser.add_argument("--patch_len", type=int, default=None)
-    parser.add_argument("--patch_stride", type=int, default=None)
-    parser.add_argument(
-        "--active_view",
-        choices=["v1", "v2_flatten", "dual"],
-        default=None,
-    )
-    parser.add_argument("--dual_view_feature_mode", choices=["avg", "v1", "v2"], default=None)
-    parser.add_argument("--lambda_cv_stage0", type=float, default=None)
-    parser.add_argument("--lambda_cv_stage1", type=float, default=None)
-    parser.add_argument("--lambda_cv_stage2", type=float, default=None)
-    parser.add_argument("--dual_score_weight_v1", type=float, default=None)
-    parser.add_argument("--dual_score_weight_v2", type=float, default=None)
-    parser.add_argument("--dual_score_weight_cv", type=float, default=None)
-    parser.add_argument("--dual_view_center_weight", type=float, default=None)
-    parser.add_argument("--dual_view_recon_weight", type=float, default=None)
-    parser.add_argument(
-        "--stage2_method",
-        choices=["separate_proto"],
-        default=None,
-    )
-    parser.add_argument("--state_dim", type=int, default=None)
-    parser.add_argument("--num_prototypes", type=int, default=None)
-    parser.add_argument("--proto_temperature", type=float, default=None)
-    parser.add_argument("--q_joint_sharpen_temperature", type=float, default=None)
-    parser.add_argument("--lambda_state_consistency", type=float, default=None)
-    parser.add_argument("--lambda_proto_pull", type=float, default=None)
-    parser.add_argument("--lambda_proto_repulsion", type=float, default=None)
-    parser.add_argument("--proto_repulsion_margin", type=float, default=None)
-    parser.add_argument("--lambda_proto_separation", type=float, default=None)
-    parser.add_argument("--proto_separation_margin", type=float, default=None)
-    parser.add_argument("--proto_separation_force_weight", type=float, default=None)
-    parser.add_argument("--tau_conf", type=float, default=None)
-    parser.add_argument("--joint_core_mode", choices=["minimal", "robust"], default=None)
-    parser.add_argument("--joint_core_dist_quantile", type=float, default=None)
-    parser.add_argument("--joint_core_recon_quantile", type=float, default=None)
-    parser.add_argument("--stage2_balanced_core", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--stage2_balanced_core_max_fraction", type=float, default=None)
-    parser.add_argument("--stage2_balanced_core_min_per_proto", type=int, default=None)
-    parser.add_argument("--lambda_proto_usage_balance", type=float, default=None)
-    parser.add_argument("--lambda_js_score", type=float, default=None)
-    parser.add_argument("--prototype_recon_weight", type=float, default=None)
-    parser.add_argument("--active_pool_trim_enabled", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--active_pool_trim_stage0_ratio", type=float, default=None)
-    parser.add_argument("--active_pool_trim_stage1_ratio", type=float, default=None)
-    parser.add_argument("--stage2_lambda_rec", type=float, default=None)
-    parser.add_argument("--stage1_triplet_margin", type=float, default=None)
-    parser.add_argument("--decision_quantile", type=float, default=None)
-    parser.add_argument("--train_step", type=int, default=None)
-    parser.add_argument("--test_step", type=int, default=None)
-    parser.add_argument("--cache_windows", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--pin_memory", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--enable_tf32", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--cudnn_benchmark", action=argparse.BooleanOptionalAction, default=None)
-    return parser.parse_args()
+    return build_parser(include_dataset=False, description=description).parse_args()
 
 
 def build_common_preset_overrides(
@@ -100,122 +33,28 @@ def build_common_preset_overrides(
     args: argparse.Namespace,
 ) -> Dict[str, object]:
     overrides = dict(local_overrides)
-    if getattr(args, "data_path", None) is not None:
-        overrides["data_path"] = str(args.data_path)
-    if getattr(args, "train_split_mode", None) is not None:
-        overrides["train_split_mode"] = str(args.train_split_mode)
-    if getattr(args, "test_split_mode", None) is not None:
-        overrides["test_split_mode"] = str(args.test_split_mode)
-    if getattr(args, "scaler_fit_mode", None) is not None:
-        overrides["scaler_fit_mode"] = str(args.scaler_fit_mode)
-    if getattr(args, "visualization_method", None) is not None:
-        overrides["visualization_method"] = str(args.visualization_method).strip().lower()
-    if getattr(args, "enable_stage1_recon_scoring", None) is not None:
-        overrides["enable_stage1_recon_scoring"] = bool(args.enable_stage1_recon_scoring)
-    if getattr(args, "tcn_layers", None) is not None:
-        overrides["tcn_layers"] = tuple(int(v) for v in args.tcn_layers)
-    if getattr(args, "latent_dim", None) is not None:
-        overrides["latent_dim"] = int(args.latent_dim)
-    if getattr(args, "v2_first_kernel_size", None) is not None:
-        overrides["v2_first_kernel_size"] = int(args.v2_first_kernel_size)
-    if getattr(args, "readout_mode", None) is not None:
-        overrides["readout_mode"] = str(args.readout_mode).strip().lower()
-    if getattr(args, "topk_ratio", None) is not None:
-        overrides["topk_ratio"] = float(args.topk_ratio)
-    if getattr(args, "topk_k", None) is not None:
-        overrides["topk_k"] = int(args.topk_k)
-    if getattr(args, "patch_len", None) is not None:
-        overrides["patch_len"] = int(args.patch_len)
-    if getattr(args, "patch_stride", None) is not None:
-        overrides["patch_stride"] = int(args.patch_stride)
-    if getattr(args, "active_view", None) is not None:
-        overrides["active_view"] = str(args.active_view).strip().lower()
-    if getattr(args, "dual_view_feature_mode", None) is not None:
-        overrides["dual_view_feature_mode"] = str(args.dual_view_feature_mode).strip().lower()
-    if getattr(args, "lambda_cv_stage0", None) is not None:
-        overrides["lambda_cv_stage0"] = float(args.lambda_cv_stage0)
-    if getattr(args, "lambda_cv_stage1", None) is not None:
-        overrides["lambda_cv_stage1"] = float(args.lambda_cv_stage1)
-    if getattr(args, "lambda_cv_stage2", None) is not None:
-        overrides["lambda_cv_stage2"] = float(args.lambda_cv_stage2)
-    if getattr(args, "dual_score_weight_v1", None) is not None:
-        overrides["dual_score_weight_v1"] = float(args.dual_score_weight_v1)
-    if getattr(args, "dual_score_weight_v2", None) is not None:
-        overrides["dual_score_weight_v2"] = float(args.dual_score_weight_v2)
-    if getattr(args, "dual_score_weight_cv", None) is not None:
-        overrides["dual_score_weight_cv"] = float(args.dual_score_weight_cv)
-    if getattr(args, "dual_view_center_weight", None) is not None:
-        overrides["dual_view_center_weight"] = float(args.dual_view_center_weight)
-    if getattr(args, "dual_view_recon_weight", None) is not None:
-        overrides["dual_view_recon_weight"] = float(args.dual_view_recon_weight)
-    if getattr(args, "stage2_method", None) is not None:
-        overrides["stage2_method"] = str(args.stage2_method).strip().lower()
-    if getattr(args, "state_dim", None) is not None:
-        overrides["state_dim"] = int(args.state_dim)
-    if getattr(args, "num_prototypes", None) is not None:
-        overrides["num_prototypes"] = int(args.num_prototypes)
-    if getattr(args, "proto_temperature", None) is not None:
-        overrides["proto_temperature"] = float(args.proto_temperature)
-    if getattr(args, "q_joint_sharpen_temperature", None) is not None:
-        overrides["q_joint_sharpen_temperature"] = float(args.q_joint_sharpen_temperature)
-    if getattr(args, "lambda_state_consistency", None) is not None:
-        overrides["lambda_state_consistency"] = float(args.lambda_state_consistency)
-    if getattr(args, "lambda_proto_pull", None) is not None:
-        overrides["lambda_proto_pull"] = float(args.lambda_proto_pull)
-    if getattr(args, "lambda_proto_repulsion", None) is not None:
-        overrides["lambda_proto_repulsion"] = float(args.lambda_proto_repulsion)
-    if getattr(args, "proto_repulsion_margin", None) is not None:
-        overrides["proto_repulsion_margin"] = float(args.proto_repulsion_margin)
-    if getattr(args, "lambda_proto_separation", None) is not None:
-        overrides["lambda_proto_separation"] = float(args.lambda_proto_separation)
-    if getattr(args, "proto_separation_margin", None) is not None:
-        overrides["proto_separation_margin"] = float(args.proto_separation_margin)
-    if getattr(args, "proto_separation_force_weight", None) is not None:
-        overrides["proto_separation_force_weight"] = float(args.proto_separation_force_weight)
-    if getattr(args, "tau_conf", None) is not None:
-        overrides["tau_conf"] = float(args.tau_conf)
-    if getattr(args, "joint_core_mode", None) is not None:
-        overrides["joint_core_mode"] = str(args.joint_core_mode).strip().lower()
-    if getattr(args, "joint_core_dist_quantile", None) is not None:
-        overrides["joint_core_dist_quantile"] = float(args.joint_core_dist_quantile)
-    if getattr(args, "joint_core_recon_quantile", None) is not None:
-        overrides["joint_core_recon_quantile"] = float(args.joint_core_recon_quantile)
-    if getattr(args, "stage2_balanced_core", None) is not None:
-        overrides["stage2_balanced_core"] = bool(args.stage2_balanced_core)
-    if getattr(args, "stage2_balanced_core_max_fraction", None) is not None:
-        overrides["stage2_balanced_core_max_fraction"] = float(args.stage2_balanced_core_max_fraction)
-    if getattr(args, "stage2_balanced_core_min_per_proto", None) is not None:
-        overrides["stage2_balanced_core_min_per_proto"] = int(args.stage2_balanced_core_min_per_proto)
-    if getattr(args, "lambda_proto_usage_balance", None) is not None:
-        overrides["lambda_proto_usage_balance"] = float(args.lambda_proto_usage_balance)
-    if getattr(args, "lambda_js_score", None) is not None:
-        overrides["lambda_js_score"] = float(args.lambda_js_score)
-    if getattr(args, "prototype_recon_weight", None) is not None:
-        overrides["prototype_recon_weight"] = float(args.prototype_recon_weight)
-    if getattr(args, "active_pool_trim_enabled", None) is not None:
-        overrides["active_pool_trim_enabled"] = bool(args.active_pool_trim_enabled)
-    if getattr(args, "active_pool_trim_stage0_ratio", None) is not None:
-        overrides["active_pool_trim_stage0_ratio"] = float(args.active_pool_trim_stage0_ratio)
-    if getattr(args, "active_pool_trim_stage1_ratio", None) is not None:
-        overrides["active_pool_trim_stage1_ratio"] = float(args.active_pool_trim_stage1_ratio)
-    if getattr(args, "stage2_lambda_rec", None) is not None:
-        overrides["stage2_lambda_rec"] = float(args.stage2_lambda_rec)
-    if getattr(args, "stage1_triplet_margin", None) is not None:
-        overrides["stage1_triplet_margin"] = float(args.stage1_triplet_margin)
-    if getattr(args, "decision_quantile", None) is not None:
-        overrides["decision_quantile"] = float(args.decision_quantile)
-    if getattr(args, "train_step", None) is not None:
-        overrides["train_step"] = int(args.train_step)
-    if getattr(args, "test_step", None) is not None:
-        overrides["test_step"] = int(args.test_step)
-    if getattr(args, "cache_windows", None) is not None:
-        overrides["cache_windows"] = bool(args.cache_windows)
-    if getattr(args, "pin_memory", None) is not None:
-        overrides["pin_memory"] = bool(args.pin_memory)
-    if getattr(args, "enable_tf32", None) is not None:
-        overrides["enable_tf32"] = bool(args.enable_tf32)
-    if getattr(args, "cudnn_benchmark", None) is not None:
-        overrides["cudnn_benchmark"] = bool(args.cudnn_benchmark)
+    json_overrides = load_json_overrides(getattr(args, "config_json", ""))
+    if json_overrides:
+        overrides = merge_configs(overrides, json_overrides)
+
+    cli_overrides = _collect_cli_overrides(args, TRAIN_OVERRIDE_KEYS)
+    for key in (
+        "active_view",
+        "dual_view_feature_mode",
+        "joint_core_mode",
+        "readout_mode",
+        "scaler_fit_mode",
+        "stage1_positive_direction",
+        "stage2_method",
+        "tcn_activation",
+        "test_split_mode",
+        "train_split_mode",
+        "visualization_method",
+    ):
+        if key in cli_overrides and isinstance(cli_overrides[key], str):
+            cli_overrides[key] = cli_overrides[key].strip().lower()
+    if cli_overrides:
+        overrides = merge_configs(overrides, cli_overrides)
     return overrides
 
 
@@ -230,12 +69,17 @@ def run_dataset_preset(
         dataset,
         overrides=build_common_preset_overrides(local_overrides, args),
     )
+    show_visualization_artifacts = (
+        bool(meta["print_visualization_artifacts"])
+        if getattr(args, "print_visualization_artifacts", None) is None
+        else bool(args.print_visualization_artifacts)
+    )
     run_training(
         config=config,
-        run_name=run_name,
-        results_root=str(meta["results_root"]),
+        run_name=getattr(args, "run_name", "") or run_name,
+        results_root=getattr(args, "results_root", "") or str(meta["results_root"]),
         experiment_name=str(dataset),
-        show_visualization_artifacts=bool(meta["print_visualization_artifacts"]),
+        show_visualization_artifacts=show_visualization_artifacts,
     )
 
 
@@ -256,6 +100,11 @@ TRAIN_OVERRIDE_KEYS = [
     "tcn_dropout",
     "tcn_activation",
     "use_attentive_pooling",
+    "readout_mode",
+    "topk_ratio",
+    "topk_k",
+    "patch_len",
+    "patch_stride",
     "active_view",
     "dual_view_feature_mode",
     "lambda_cv_stage0",
@@ -287,6 +136,9 @@ TRAIN_OVERRIDE_KEYS = [
     "stage2_balanced_core_max_fraction",
     "stage2_balanced_core_min_per_proto",
     "lambda_proto_usage_balance",
+    "stage2_token_kmeans_max_tokens",
+    "lambda_injected_push",
+    "stage2_injected_margin",
     "lambda_js_score",
     "prototype_recon_weight",
     "active_pool_trim_enabled",
@@ -326,14 +178,18 @@ TRAIN_OVERRIDE_KEYS = [
 ]
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Shared training entry for dataset presets.")
-    parser.add_argument(
-        "--dataset",
-        type=str,
-        required=True,
-        help=f"Dataset preset name. Available: {', '.join(available_datasets())}",
-    )
+def build_parser(
+    include_dataset: bool = True,
+    description: str = "Shared training entry for dataset presets.",
+) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=description)
+    if include_dataset:
+        parser.add_argument(
+            "--dataset",
+            type=str,
+            required=True,
+            help=f"Dataset preset name. Available: {', '.join(available_datasets())}",
+        )
     parser.add_argument("--run_name", type=str, default="")
     parser.add_argument("--results_root", type=str, default="")
     parser.add_argument("--config_json", type=str, default="")
@@ -355,6 +211,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tcn_dropout", type=float, default=None)
     parser.add_argument("--tcn_activation", type=str, default=None)
     parser.add_argument("--use_attentive_pooling", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument(
+        "--readout_mode",
+        type=str,
+        default=None,
+        choices=["attn_topk_max", "attention", "attn", "last", "topk_max"],
+    )
+    parser.add_argument("--topk_ratio", type=float, default=None)
+    parser.add_argument("--topk_k", type=int, default=None)
+    parser.add_argument("--patch_len", type=int, default=None)
+    parser.add_argument("--patch_stride", type=int, default=None)
     parser.add_argument(
         "--active_view",
         type=str,
@@ -395,6 +261,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stage2_balanced_core_max_fraction", type=float, default=None)
     parser.add_argument("--stage2_balanced_core_min_per_proto", type=int, default=None)
     parser.add_argument("--lambda_proto_usage_balance", type=float, default=None)
+    parser.add_argument("--stage2_token_kmeans_max_tokens", type=int, default=None)
+    parser.add_argument("--lambda_injected_push", type=float, default=None)
+    parser.add_argument("--stage2_injected_margin", type=float, default=None)
     parser.add_argument("--lambda_js_score", type=float, default=None)
     parser.add_argument("--prototype_recon_weight", type=float, default=None)
     parser.add_argument("--active_pool_trim_enabled", action=argparse.BooleanOptionalAction, default=None)

@@ -37,16 +37,37 @@ class PrototypeHead(nn.Module):
             )
         self.prototypes.copy_(centers.to(device=self.prototypes.device, dtype=self.prototypes.dtype))
 
-    def distances(self, u: torch.Tensor) -> torch.Tensor:
-        return torch.cdist(u, self.prototypes, p=2.0) ** 2
+    def distances(self, u: torch.Tensor, detach_prototypes: bool = False) -> torch.Tensor:
+        if u.size(-1) != self.state_dim:
+            raise ValueError(
+                f"PrototypeHead expected last dim D={self.state_dim}, got {int(u.size(-1))}."
+            )
+        leading_shape = u.shape[:-1]
+        u_flat = u.reshape(-1, self.state_dim)
+        prototypes = self.prototypes.detach() if bool(detach_prototypes) else self.prototypes
+        dist_sq_flat = torch.cdist(u_flat, prototypes, p=2.0) ** 2
+        return dist_sq_flat.reshape(*leading_shape, self.num_prototypes)
 
-    def forward(self, u: torch.Tensor) -> dict:
-        dist_sq = self.distances(u)
-        logits = -dist_sq / max(float(self.temperature), 1e-6)
-        q = F.softmax(logits, dim=1)
-        conf, pred = torch.max(q, dim=1)
-        min_dist_sq = torch.gather(dist_sq, 1, pred.view(-1, 1)).squeeze(1)
-        min_dist = torch.sqrt(min_dist_sq.clamp_min(0.0) + 1e-12)
+    def forward(self, u: torch.Tensor, detach_prototypes: bool = False) -> dict:
+        if u.size(-1) != self.state_dim:
+            raise ValueError(
+                f"PrototypeHead expected last dim D={self.state_dim}, got {int(u.size(-1))}."
+            )
+        leading_shape = u.shape[:-1]
+        u_flat = u.reshape(-1, self.state_dim)
+        prototypes = self.prototypes.detach() if bool(detach_prototypes) else self.prototypes
+        dist_sq_flat = torch.cdist(u_flat, prototypes, p=2.0) ** 2
+        logits_flat = -dist_sq_flat / max(float(self.temperature), 1e-6)
+        q_flat = F.softmax(logits_flat, dim=-1)
+        conf_flat, pred_flat = torch.max(q_flat, dim=-1)
+        min_dist_sq_flat = torch.gather(dist_sq_flat, 1, pred_flat.view(-1, 1)).squeeze(1)
+        min_dist_flat = torch.sqrt(min_dist_sq_flat.clamp_min(0.0) + 1e-12)
+
+        dist_sq = dist_sq_flat.reshape(*leading_shape, self.num_prototypes)
+        q = q_flat.reshape(*leading_shape, self.num_prototypes)
+        pred = pred_flat.reshape(*leading_shape)
+        conf = conf_flat.reshape(*leading_shape)
+        min_dist = min_dist_flat.reshape(*leading_shape)
         return {
             "dist_sq": dist_sq,
             "q": q,
@@ -73,8 +94,8 @@ class DualViewPrototypeHeads(nn.Module):
         self.prototype_head_v1.init_from_centers(centers_v1)
         self.prototype_head_v2.init_from_centers(centers_v2)
 
-    def forward(self, u1: torch.Tensor, u2: torch.Tensor) -> dict:
+    def forward(self, u1: torch.Tensor, u2: torch.Tensor, detach_prototypes: bool = False) -> dict:
         return {
-            "view1": self.prototype_head_v1(u1),
-            "view2": self.prototype_head_v2(u2),
+            "view1": self.prototype_head_v1(u1, detach_prototypes=detach_prototypes),
+            "view2": self.prototype_head_v2(u2, detach_prototypes=detach_prototypes),
         }
