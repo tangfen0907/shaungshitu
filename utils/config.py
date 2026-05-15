@@ -68,6 +68,11 @@ class Config:
     lambda_proto_usage_balance: float = 0.0
     lambda_proto_relation_consistency: float = 0.0
     stage2_time_kmeans_max_tokens: int = 200000
+    stage2_time_kmeans_mode: str = "last"
+    stage2_time_core_dist_quantile: float = 0.8
+    stage2_proto_ema_update: bool = True
+    stage2_proto_ema_decay: float = 0.95
+    stage2_proto_ema_min_tokens: int = 1
     lambda_injected_push: float = 0.1
     stage2_injected_margin: float = 1.0
     lambda_js_score: float = 1.0
@@ -201,6 +206,11 @@ _COMMON_EXPLICIT: Dict[str, object] = {
     "stage2_balanced_core_min_per_proto": 0,
     "lambda_proto_usage_balance": 0.0,
     "stage2_time_kmeans_max_tokens": 200000,
+    "stage2_time_kmeans_mode": "last",
+    "stage2_time_core_dist_quantile": 0.8,
+    "stage2_proto_ema_update": True,
+    "stage2_proto_ema_decay": 0.95,
+    "stage2_proto_ema_min_tokens": 1,
     "lambda_injected_push": 0.1,
     "stage2_injected_margin": 1.0,
     "lambda_js_score": 1.0,
@@ -416,6 +426,11 @@ _STAGE2_METHOD_DEFAULTS: Dict[str, Dict[str, object]] = {
         "lambda_proto_pull": 0.2,
         "q_joint_sharpen_temperature": 1.0,
         "lambda_proto_usage_balance": 0.05,
+        "stage2_time_kmeans_mode": "last",
+        "stage2_time_core_dist_quantile": 0.8,
+        "stage2_proto_ema_update": True,
+        "stage2_proto_ema_decay": 0.95,
+        "stage2_proto_ema_min_tokens": 1,
         "stage2_balanced_core": True,
         "stage2_balanced_core_max_fraction": 0.35,
         "stage2_balanced_core_min_per_proto": 16,

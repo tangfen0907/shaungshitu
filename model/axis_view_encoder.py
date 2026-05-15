@@ -482,7 +482,7 @@ class VariableTokenRelationEncoder(nn.Module):
         different datasets with different variable counts.
 
     Input:
-        h1_patch: [B, N, P, D1]
+        patch_tokens: [B, N, P, D1]
     Intermediate:
         patch readout per variable: [B * N, P, D1] -> [B * N, Dv]
         var_tokens: [B, N, Dv]
@@ -538,17 +538,17 @@ class VariableTokenRelationEncoder(nn.Module):
             nn.Dropout(float(dropout)),
         )
 
-    def forward(self, h1_patch: torch.Tensor) -> tuple:
-        if h1_patch.dim() != 4:
-            raise ValueError(f"VariableTokenRelationEncoder expects [B, N, P, D1], got {tuple(h1_patch.shape)}")
-        if h1_patch.size(-1) != self.input_dim:
+    def forward(self, patch_tokens: torch.Tensor) -> tuple:
+        if patch_tokens.dim() != 4:
+            raise ValueError(f"VariableTokenRelationEncoder expects [B, N, P, D1], got {tuple(patch_tokens.shape)}")
+        if patch_tokens.size(-1) != self.input_dim:
             raise ValueError(
-                f"VariableTokenRelationEncoder expected D1={self.input_dim}, got D1={int(h1_patch.size(-1))}"
+                f"VariableTokenRelationEncoder expected D1={self.input_dim}, got D1={int(patch_tokens.size(-1))}"
             )
 
-        batch_size, num_variables, patch_count, _ = h1_patch.shape
+        batch_size, num_variables, patch_count, _ = patch_tokens.shape
         # [B, N, P, D1] -> [B * N, P, D1]
-        per_variable_patches = h1_patch.reshape(batch_size * num_variables, patch_count, self.input_dim)
+        per_variable_patches = patch_tokens.reshape(batch_size * num_variables, patch_count, self.input_dim)
         # [B * N, P, D1] -> [B * N, Dv] -> [B, N, D2]
         var_tokens = self.variable_patch_readout(per_variable_patches).reshape(
             batch_size,
@@ -560,7 +560,7 @@ class VariableTokenRelationEncoder(nn.Module):
         # [B, N, D2] -> [B, N, P, D2]
         relation_context = h2_var.unsqueeze(2).expand(-1, -1, patch_count, -1)
         # [B, N, P, D1 + D2] -> [B, N, P, D2]
-        h2_patch = self.patch_fusion(torch.cat([h1_patch, relation_context], dim=-1))
+        h2_patch = self.patch_fusion(torch.cat([patch_tokens, relation_context], dim=-1))
         return h2_var, h2_patch
 
 
@@ -571,6 +571,8 @@ class PatchRelationDualEncoder(nn.Module):
     Core representations:
         h1_patch: [B, N, P, D1]
             Channel-independent patch temporal tokens.
+        h2_input_patch: [B, N, P, D1]
+            Independent View2 patch tokens from the raw input.
         h2_var: [B, N, D2]
             Variable-token relation/system state tokens.
         h2_patch: [B, N, P, D2]
@@ -620,6 +622,15 @@ class PatchRelationDualEncoder(nn.Module):
             dropout=dropout,
             activation=activation,
         )
+        self.view2_patch_encoder = ChannelIndependentPatchTemporalEncoder(
+            patch_len=self.patch_len,
+            patch_stride=self.patch_stride,
+            dim=self.d1,
+            num_blocks=patch_blocks,
+            kernels=self.kernels,
+            dropout=dropout,
+            activation=activation,
+        )
         self.view2_relation_encoder = VariableTokenRelationEncoder(
             input_dim=self.d1,
             relation_dim=self.d2,
@@ -659,8 +670,9 @@ class PatchRelationDualEncoder(nn.Module):
         # View1 core: [B, N, T] -> [B, N, P, D1]
         h1_patch = self.view1_patch_encoder(x)
         patch_count = int(h1_patch.size(2))
-        # View2 core: [B, N, P, D1] -> [B, N, D2], [B, N, P, D2]
-        h2_var, h2_patch = self.view2_relation_encoder(h1_patch)
+        # View2 core: [B, N, T] -> [B, N, P, D1] -> [B, N, D2], [B, N, P, D2]
+        h2_input_patch = self.view2_patch_encoder(x)
+        h2_var, h2_patch = self.view2_relation_encoder(h2_input_patch)
 
         # Compatibility readouts only. Core representations stay token-level.
         # [B, N, P, D1] -> [B, N * P, D1] -> [B, latent_dim]
@@ -670,6 +682,7 @@ class PatchRelationDualEncoder(nn.Module):
 
         return {
             "h1_patch": h1_patch,
+            "h2_input_patch": h2_input_patch,
             "h2_var": h2_var,
             "h2_patch": h2_patch,
             "z1_global": z1_global,

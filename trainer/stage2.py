@@ -25,8 +25,12 @@ __all__ = [
     "_uses_separate_prototypes",
     "_resolve_stage2_schedule",
     "_zero_stage2_loss",
+    "_select_time_kmeans_features",
     "_collect_separate_view_state_features",
     "_build_separate_joint_kmeans_features",
+    "_balance_time_core_by_prototype",
+    "_time_core_mask_from_outputs",
+    "_ema_update_time_prototypes",
     "_collect_separate_proto_outputs",
     "_initialize_separate_prototypes",
     "_build_separate_proto_state",
@@ -91,6 +95,24 @@ def _resolve_stage2_schedule(self) -> Tuple[int, int]:
 def _zero_stage2_loss(self) -> torch.Tensor:
     return torch.zeros((), device=self.device)
 
+
+def _select_time_kmeans_features(
+    self,
+    u1_time: torch.Tensor,
+    u2_time: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, str]:
+    mode = str(getattr(self.config, "stage2_time_kmeans_mode", "last")).strip().lower()
+    if mode in {"last", "last_token", "last-time", "last_time"}:
+        return u1_time[:, -1, :], u2_time[:, -1, :], "last"
+    if mode in {"all", "all_time", "all-time"}:
+        return (
+            u1_time.reshape(-1, u1_time.size(-1)),
+            u2_time.reshape(-1, u2_time.size(-1)),
+            "all",
+        )
+    raise ValueError("stage2_time_kmeans_mode should be 'last' or 'all'.")
+
+
 def _collect_separate_view_state_features(self, loader: DataLoader) -> Tuple[np.ndarray, np.ndarray]:
     if not self._is_dual_view_model():
         raise RuntimeError("separate_proto requires a dual-view model.")
@@ -98,14 +120,16 @@ def _collect_separate_view_state_features(self, loader: DataLoader) -> Tuple[np.
     self.model.eval()
     features_v1: List[np.ndarray] = []
     features_v2: List[np.ndarray] = []
+    feature_mode = "last"
     with torch.inference_mode():
         for batch in loader:
             x = self._prepare_batch(batch)
             outputs = self.model(x, stage="stage2")
             u1_time = outputs["u1_time"]
             u2_time = outputs["u2_time"]
-            features_v1.append(u1_time.reshape(-1, u1_time.size(-1)).detach().cpu().numpy())
-            features_v2.append(u2_time.reshape(-1, u2_time.size(-1)).detach().cpu().numpy())
+            selected_v1, selected_v2, feature_mode = self._select_time_kmeans_features(u1_time, u2_time)
+            features_v1.append(selected_v1.detach().cpu().numpy())
+            features_v2.append(selected_v2.detach().cpu().numpy())
     if was_training:
         self.model.train()
     if not features_v1 or not features_v2:
@@ -119,14 +143,14 @@ def _collect_separate_view_state_features(self, loader: DataLoader) -> Tuple[np.
             f"v1={features_v1.shape[0]}, v2={features_v2.shape[0]}"
         )
 
-    total_time_tokens = int(features_v1.shape[0])
+    total_kmeans_tokens = int(features_v1.shape[0])
     max_tokens = int(
         getattr(self.config, "stage2_time_kmeans_max_tokens", 200000)
     )
-    sampled_tokens = total_time_tokens
-    if max_tokens > 0 and total_time_tokens > max_tokens:
+    sampled_tokens = total_kmeans_tokens
+    if max_tokens > 0 and total_kmeans_tokens > max_tokens:
         rng = np.random.default_rng(int(getattr(self.config, "seed", 42)))
-        indices = rng.choice(total_time_tokens, size=max_tokens, replace=False)
+        indices = rng.choice(total_kmeans_tokens, size=max_tokens, replace=False)
         indices.sort()
         features_v1 = features_v1[indices]
         features_v2 = features_v2[indices]
@@ -134,12 +158,106 @@ def _collect_separate_view_state_features(self, loader: DataLoader) -> Tuple[np.
 
     print(
         "[Stage2-TimeProto] time-token KMeans features | "
+        f"mode={feature_mode} | "
         f"h1_time_features={tuple(features_v1.shape)} | "
         f"h2_time_features={tuple(features_v2.shape)} | "
-        f"total_time_tokens={total_time_tokens} | "
-        f"sampled_time_tokens={sampled_tokens}"
+        f"total_kmeans_tokens={total_kmeans_tokens} | "
+        f"sampled_kmeans_tokens={sampled_tokens}"
     )
     return features_v1, features_v2
+
+
+def _balance_time_core_by_prototype(
+    self,
+    time_core: torch.Tensor,
+    labels: torch.Tensor,
+    score: torch.Tensor,
+) -> torch.Tensor:
+    if not bool(getattr(self.config, "stage2_balanced_core", False)):
+        return time_core
+    total_core = int(time_core.float().sum().item())
+    if total_core <= 0:
+        return time_core
+    max_fraction = min(max(float(getattr(self.config, "stage2_balanced_core_max_fraction", 1.0)), 0.0), 1.0)
+    min_per_proto = max(0, int(getattr(self.config, "stage2_balanced_core_min_per_proto", 0)))
+    cap = total_core if max_fraction >= 1.0 else max(min_per_proto, int(np.ceil(total_core * max_fraction)))
+    if cap >= total_core:
+        return time_core
+
+    balanced = torch.zeros_like(time_core, dtype=torch.bool)
+    flat_balanced = balanced.reshape(-1)
+    flat_core = time_core.reshape(-1)
+    flat_labels = labels.reshape(-1)
+    flat_score = score.reshape(-1)
+    num_prototypes = int(getattr(self.model.prototype_head_v1, "num_prototypes", 1))
+    for proto_id in range(max(1, num_prototypes)):
+        proto_indices = torch.nonzero(flat_core & (flat_labels == proto_id), as_tuple=False).flatten()
+        if proto_indices.numel() == 0:
+            continue
+        keep_count = min(int(proto_indices.numel()), int(cap))
+        order = torch.argsort(flat_score[proto_indices], stable=True)
+        flat_balanced[proto_indices[order[:keep_count]]] = True
+    return balanced
+
+
+def _time_core_mask_from_outputs(self, outputs: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    tau_time = float(getattr(self.config, "tau_time", getattr(self.config, "tau_conf", 0.7)))
+    q_joint_time = 0.5 * (outputs["q1_time"] + outputs["q2_time"])
+    labels = torch.argmax(q_joint_time, dim=-1)
+    score = 0.5 * (outputs["proto_dist1_time"] + outputs["proto_dist2_time"])
+    time_core = (
+        (outputs["proto_pred1_time"] == outputs["proto_pred2_time"])
+        & (outputs["proto_conf1_time"] > tau_time)
+        & (outputs["proto_conf2_time"] > tau_time)
+    )
+    dist_quantile = float(
+        getattr(
+            self.config,
+            "stage2_time_core_dist_quantile",
+            getattr(self.config, "joint_core_dist_quantile", 0.8),
+        )
+    )
+    dist_quantile = min(max(dist_quantile, 0.0), 1.0)
+    if dist_quantile < 1.0 and bool(time_core.any()):
+        threshold = torch.quantile(score[time_core].detach(), dist_quantile)
+        time_core = time_core & (score <= threshold)
+    time_core = self._balance_time_core_by_prototype(time_core, labels, score.detach())
+    return time_core, labels, score
+
+
+@torch.no_grad()
+def _ema_update_time_prototypes(
+    self,
+    ema_payload: Optional[Dict[str, torch.Tensor]],
+) -> Tuple[float, float]:
+    if not bool(getattr(self.config, "stage2_proto_ema_update", True)):
+        return 0.0, 0.0
+    if not ema_payload:
+        return 0.0, 0.0
+    time_core = ema_payload["time_core"].bool()
+    if not bool(time_core.any()):
+        return 0.0, 0.0
+
+    decay = min(max(float(getattr(self.config, "stage2_proto_ema_decay", 0.95)), 0.0), 0.9999)
+    min_tokens = max(1, int(getattr(self.config, "stage2_proto_ema_min_tokens", 1)))
+    u1_time = ema_payload["u1_time"].detach()
+    u2_time = ema_payload["u2_time"].detach()
+    labels = ema_payload["labels"].long()
+    updates = 0
+    token_count = 0
+    num_prototypes = int(getattr(self.model.prototype_head_v1, "num_prototypes", 1))
+    for proto_id in range(max(1, num_prototypes)):
+        proto_mask = time_core & (labels == proto_id)
+        count = int(proto_mask.float().sum().item())
+        if count < min_tokens:
+            continue
+        center_v1 = u1_time[proto_mask].mean(dim=0)
+        center_v2 = u2_time[proto_mask].mean(dim=0)
+        self.model.prototype_head_v1.prototypes[proto_id].mul_(decay).add_(center_v1, alpha=1.0 - decay)
+        self.model.prototype_head_v2.prototypes[proto_id].mul_(decay).add_(center_v2, alpha=1.0 - decay)
+        updates += 1
+        token_count += count
+    return float(updates), float(token_count)
 
 
 def _build_separate_joint_kmeans_features(
@@ -212,12 +330,7 @@ def _collect_separate_proto_outputs(self, loader: DataLoader) -> Dict[str, np.nd
                 proto_dist2_time_max = outputs["proto_dist2_time"].max(dim=1).values
                 time_conf1_mean = outputs["proto_conf1_time"].mean(dim=1)
                 time_conf2_mean = outputs["proto_conf2_time"].mean(dim=1)
-                tau_time = float(getattr(self.config, "tau_time", getattr(self.config, "tau_conf", 0.7)))
-                time_core = (
-                    (outputs["proto_pred1_time"] == outputs["proto_pred2_time"])
-                    & (outputs["proto_conf1_time"] > tau_time)
-                    & (outputs["proto_conf2_time"] > tau_time)
-                )
+                time_core, _, _ = self._time_core_mask_from_outputs(outputs)
                 time_core_ratio = time_core.float().mean(dim=1)
                 if self._uses_separate_prototypes():
                     u_joint = F.normalize(torch.cat([u1, u2], dim=1), dim=1)
@@ -557,38 +670,6 @@ def _refresh_separate_joint_core(self, round_idx: int):
             & (np.asarray(outputs["recon1"]) <= recon1_thr)
             & (np.asarray(outputs["recon2"]) <= recon2_thr)
         )
-    if self._stage2_method() == "separate_proto" and bool(
-        getattr(self.config, "stage2_balanced_core", False)
-    ):
-        labels_for_balance = np.argmax(
-            0.5 * (
-                np.asarray(outputs["q1"], dtype=np.float32)
-                + np.asarray(outputs["q2"], dtype=np.float32)
-            ),
-            axis=1,
-        ).astype(np.int64)
-        core_count = int(np.sum(joint_core))
-        if core_count > 0:
-            max_fraction = min(max(float(getattr(self.config, "stage2_balanced_core_max_fraction", 1.0)), 0.0), 1.0)
-            min_per_proto = max(0, int(getattr(self.config, "stage2_balanced_core_min_per_proto", 0)))
-            cap = max(min_per_proto, int(np.ceil(core_count * max_fraction))) if max_fraction < 1.0 else core_count
-            if cap < core_count:
-                core_score = (
-                    np.asarray(outputs["proto_dist1"], dtype=np.float32)
-                    + np.asarray(outputs["proto_dist2"], dtype=np.float32)
-                    + np.asarray(outputs["recon1"], dtype=np.float32)
-                    + np.asarray(outputs["recon2"], dtype=np.float32)
-                )
-                balanced_core = np.zeros_like(joint_core, dtype=bool)
-                num_proto = int(outputs["q1"].shape[1]) if np.ndim(outputs["q1"]) == 2 else int(np.max(labels_for_balance) + 1)
-                for proto_id in range(max(1, num_proto)):
-                    proto_indices = np.where(joint_core & (labels_for_balance == proto_id))[0]
-                    if proto_indices.size == 0:
-                        continue
-                    keep_count = min(int(proto_indices.size), int(cap))
-                    order = np.argsort(core_score[proto_indices], kind="mergesort")
-                    balanced_core[proto_indices[order[:keep_count]]] = True
-                joint_core = balanced_core
     self.separate_joint_core_mask = joint_core.astype(bool)
     self.separate_proto_train_outputs = outputs
     state = self._build_separate_proto_state(outputs, self.separate_joint_core_mask, round_idx=round_idx)
@@ -705,6 +786,7 @@ def _separate_proto_batch_loss(self, raw_batch) -> Tuple[torch.Tensor, Dict[str,
     js_time = self._zero_stage2_loss()
     time_core_count = self._zero_stage2_loss()
     time_core_ratio = self._zero_stage2_loss()
+    ema_payload = None
     if use_separate:
         q1_time = outputs["q1_time"]
         q2_time = outputs["q2_time"]
@@ -713,12 +795,7 @@ def _separate_proto_batch_loss(self, raw_batch) -> Tuple[torch.Tensor, Dict[str,
             q2_time.reshape(-1, q2_time.size(-1)),
             eps=float(getattr(self.config, "robust_eps", 1e-8)),
         ).mean()
-        tau_time = float(getattr(self.config, "tau_time", getattr(self.config, "tau_conf", 0.7)))
-        time_core = (
-            (outputs["proto_pred1_time"] == outputs["proto_pred2_time"])
-            & (outputs["proto_conf1_time"] > tau_time)
-            & (outputs["proto_conf2_time"] > tau_time)
-        )
+        time_core, time_labels, _ = self._time_core_mask_from_outputs(outputs)
         time_core_count = time_core.float().sum()
         time_core_ratio = time_core.float().mean()
         if bool(time_core.any()):
@@ -727,6 +804,12 @@ def _separate_proto_batch_loss(self, raw_batch) -> Tuple[torch.Tensor, Dict[str,
             loss_pull = 0.5 * (pull1 + pull2)
         else:
             loss_pull = self._zero_stage2_loss()
+        ema_payload = {
+            "u1_time": outputs["u1_time"].detach(),
+            "u2_time": outputs["u2_time"].detach(),
+            "time_core": time_core.detach(),
+            "labels": time_labels.detach(),
+        }
     else:
         core_np = np.asarray(getattr(self, "separate_joint_core_mask", np.ones(x.size(0), dtype=bool)), dtype=bool)
         batch_core = torch.as_tensor(
@@ -783,7 +866,8 @@ def _separate_proto_batch_loss(self, raw_batch) -> Tuple[torch.Tensor, Dict[str,
             loss_push_injected = 0.5 * (push1 + push2)
 
     lambda_separation = float(getattr(self.config, "lambda_proto_separation", 0.3))
-    if lambda_separation != 0.0:
+    proto_ema_update = bool(getattr(self.config, "stage2_proto_ema_update", True))
+    if lambda_separation != 0.0 and not (use_separate and proto_ema_update):
         if use_separate:
             sep1 = prototype_separation_loss(
                 self.model.prototype_head_v1.prototypes,
@@ -877,6 +961,7 @@ def _separate_proto_batch_loss(self, raw_batch) -> Tuple[torch.Tensor, Dict[str,
         "rec_v2": rec_v2,
         "proto_min_dist": proto_min_dist,
         "batch_joint_core": time_core_count,
+        "_ema_payload": ema_payload,
     }
 
 
@@ -908,6 +993,8 @@ def _stage2_separate_proto_epoch(
         "loss_rec": 0.0,
         "proto_min_dist": 0.0,
         "batch_joint_core": 0.0,
+        "proto_ema_updates": 0.0,
+        "proto_ema_tokens": 0.0,
     }
     log_label = "Stage2-TimeProto"
     progress = tqdm(
@@ -918,9 +1005,13 @@ def _stage2_separate_proto_epoch(
     )
     for batch in progress:
         loss, batch_losses = self._separate_proto_batch_loss(batch)
+        ema_payload = batch_losses.pop("_ema_payload", None)
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
         self.optimizer.step()
+        ema_updates, ema_tokens = self._ema_update_time_prototypes(ema_payload)
+        batch_losses["proto_ema_updates"] = torch.tensor(float(ema_updates), device=self.device)
+        batch_losses["proto_ema_tokens"] = torch.tensor(float(ema_tokens), device=self.device)
         for key in totals:
             totals[key] += float(batch_losses[key].item())
         progress.set_postfix(
@@ -931,6 +1022,7 @@ def _stage2_separate_proto_epoch(
                 "pull": f"{batch_losses['loss_pull'].item():.4f}",
                 "push": f"{batch_losses['loss_push_injected'].item():.4f}",
                 "time_core": f"{batch_losses['time_core_ratio'].item():.4f}",
+                "ema": f"{batch_losses['proto_ema_updates'].item():.0f}",
                 "sep": f"{batch_losses['loss_proto_separation'].item():.4f}",
                 "bal": f"{batch_losses['loss_usage_balance'].item():.4f}",
                 "rel": f"{batch_losses['loss_proto_relation'].item():.4f}",
@@ -960,6 +1052,8 @@ def _stage2_separate_proto_epoch(
             "loss_proto_separation": totals["loss_proto_separation"] / denom,
             "loss_usage_balance": totals["loss_usage_balance"] / denom,
             "loss_proto_relation": totals["loss_proto_relation"] / denom,
+            "proto_ema_updates": totals["proto_ema_updates"] / denom,
+            "proto_ema_tokens": totals["proto_ema_tokens"] / denom,
             "proto_min_dist": totals["proto_min_dist"] / denom,
             "loss_rec": totals["loss_rec"] / denom,
         },

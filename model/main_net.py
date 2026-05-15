@@ -104,8 +104,16 @@ class AnomalyDetector(nn.Module):
                 hidden_dim=max(128, latent_dim * 2),
             )
             patch_token_dim = int(tuple(tcn_layers)[0])
-            self.patch_to_time_v1 = nn.Linear(patch_token_dim, self.patch_len * self.state_dim)
-            self.patch_to_time_v2 = nn.Linear(patch_token_dim, self.patch_len * self.state_dim)
+            self.patch_value_projector_v1 = (
+                nn.Identity()
+                if patch_token_dim == self.state_dim
+                else nn.Linear(patch_token_dim, self.state_dim)
+            )
+            self.patch_value_projector_v2 = (
+                nn.Identity()
+                if patch_token_dim == self.state_dim
+                else nn.Linear(patch_token_dim, self.state_dim)
+            )
             self._time_proto_shape_logged = False
         elif self.active_view == "v1":
             encoder_in_channels = self.raw_in_channels
@@ -145,6 +153,8 @@ class AnomalyDetector(nn.Module):
             )
             self.prototype_head_v1 = self.prototype_heads.prototype_head_v1
             self.prototype_head_v2 = self.prototype_heads.prototype_head_v2
+            self.prototype_head_v1.prototypes.requires_grad_(False)
+            self.prototype_head_v2.prototypes.requires_grad_(False)
         else:
             self.prototype_head = PrototypeHead(
                 num_prototypes=self.num_prototypes,
@@ -404,13 +414,11 @@ class AnomalyDetector(nn.Module):
             raise ValueError(f"patch-to-time expects [B, N, P, D], got {tuple(h_patch.shape)}")
         batch_size, num_variables, patch_count, _ = h_patch.shape
         length = max(1, int(length))
-        expanded = projector(h_patch).reshape(
-            batch_size,
-            num_variables,
-            patch_count,
-            self.patch_len,
-            self.state_dim,
-        )
+        patch_values = projector(h_patch)
+        if patch_values.size(-1) != self.state_dim:
+            raise ValueError(
+                f"patch-to-time expected projected D={self.state_dim}, got {int(patch_values.size(-1))}."
+            )
         time_values = h_patch.new_zeros(batch_size, num_variables, length, self.state_dim)
         counts = h_patch.new_zeros(length)
         for patch_idx in range(patch_count):
@@ -418,8 +426,7 @@ class AnomalyDetector(nn.Module):
             if start >= length:
                 continue
             end = min(start + self.patch_len, length)
-            span = end - start
-            time_values[:, :, start:end, :] = time_values[:, :, start:end, :] + expanded[:, :, patch_idx, :span, :]
+            time_values[:, :, start:end, :] = time_values[:, :, start:end, :] + patch_values[:, :, patch_idx, :].unsqueeze(2)
             counts[start:end] = counts[start:end] + 1.0
         return time_values / counts.clamp_min(1.0).view(1, 1, length, 1)
 
@@ -469,6 +476,7 @@ class AnomalyDetector(nn.Module):
                     "x_hat2": x_hat2,
                     "x_hat2_raw": x_hat2_raw,
                     "h1_patch": dual_features["h1_patch"],
+                    "h2_input_patch": dual_features["h2_input_patch"],
                     "h2_var": dual_features["h2_var"],
                     "h2_patch": dual_features["h2_patch"],
                 }
@@ -478,8 +486,8 @@ class AnomalyDetector(nn.Module):
             if self.is_dual_view:
                 h1_patch = dual_features["h1_patch"]
                 h2_patch = dual_features["h2_patch"]
-                h1_time_var = self._patch_tokens_to_time(h1_patch, self.patch_to_time_v1, x.size(-1))
-                h2_time_var = self._patch_tokens_to_time(h2_patch, self.patch_to_time_v2, x.size(-1))
+                h1_time_var = self._patch_tokens_to_time(h1_patch, self.patch_value_projector_v1, x.size(-1))
+                h2_time_var = self._patch_tokens_to_time(h2_patch, self.patch_value_projector_v2, x.size(-1))
                 u1_time = h1_time_var.mean(dim=1)
                 u2_time = h2_time_var.mean(dim=1)
                 proto1 = self.prototype_head_v1(u1_time, detach_prototypes=detach_prototypes)
