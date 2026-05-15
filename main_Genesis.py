@@ -7,8 +7,8 @@ LOCAL_CONFIG_OVERRIDES = {
     'data_path': 'dataset/Genesis',
     'seq_len': 100,
     'step': 1,
-    'train_step': -1,
-    'test_step': -1,
+    'train_step': 5,
+    'test_step': 1,
     'in_channels': 18,
 
     # Dual-view encoder

@@ -17,8 +17,8 @@ class Config:
     spacecraft: str = ""
     metadata_path: str = ""
     step: int = 1
-    train_step: int = -1
-    test_step: int = -1
+    train_step: int = 5
+    test_step: int = 1
     seq_len: int = 100
     in_channels: int = 8
     tcn_layers: Tuple[int, ...] = (64, 128, 128)
@@ -176,8 +176,8 @@ def _default_device() -> str:
 _COMMON_EXPLICIT: Dict[str, object] = {
     "seq_len": 100,
     "step": 1,
-    "train_step": -1,
-    "test_step": -1,
+    "train_step": 5,
+    "test_step": 1,
     "latent_dim": 64,
     "tcn_kernel_size": 3,
     "v2_first_kernel_size": 0,

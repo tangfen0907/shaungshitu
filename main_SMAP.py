@@ -5,9 +5,9 @@ RUN_NAME = 'smap_experiment'
 LOCAL_CONFIG_OVERRIDES = {
     'dataset': 'SMAP',
     'data_path': 'dataset/SMAP',
-    'step': 5,
-    'train_step': 10,
-    'test_step': 10,
+    'step': 1,
+    'train_step': 5,
+    'test_step': 1,
     'active_view': 'dual',
     'latent_dim': 96,
     'dual_history_len': 20,
