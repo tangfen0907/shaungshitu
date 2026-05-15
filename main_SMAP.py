@@ -14,16 +14,12 @@ LOCAL_CONFIG_OVERRIDES = {
     'dual_current_out': 8,
     'dual_short_out': 24,
     'dual_long_out': 24,
-    'lambda_ctx_stage1': 0.05,
+    'lambda_away_stage1': 0.05,
     'num_prototypes': 10,
     'proto_temperature': 0.5,
-    'stage2_balanced_core_max_fraction': 0.5,
-    'tau_conf': 0.1,
     'batch_size': 64,
     'num_workers': 8,
     'cache_windows': True,
-    'negative_injection_profile': 'relational_smap',
-    'stage2_relational_negative_p': 1.0,
     'visualization_method': 'pca',
 }
 

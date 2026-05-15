@@ -82,7 +82,7 @@ class Config:
     # Training schedule
     epoch_stage0: int = 10
     epoch_stage1: int = 10
-    epoch_stage2: int = 20
+    epoch_stage2: int = 6
     batch_size: int = 128
     lr: float = 1e-3
     weight_decay: float = 1e-5
@@ -91,8 +91,10 @@ class Config:
     stage2_block_epochs: int = 5
 
     # Stage 2 prototype training
-    num_stage2_rounds: int = 4
+    num_stage2_rounds: int = 3
     epochs_per_stage2_round: int = 5
+    stage2_a_epochs: int = 1
+    stage2_b_epochs: int = 1
     stage2_lambda_rec: float = 1.0
 
     # Reconstruction and anomaly score composition
@@ -113,6 +115,24 @@ class Config:
     lambda_ctx_stage1: float = 0.05
     stage1_positive_offset: int = 1
     stage1_positive_direction: str = "past"
+    stage1_inject_context_len: int = 0
+    lambda_away_stage1: float = 0.05
+    margin_stage1: float = 1.0
+    stage2_inject_context_len: int = 0
+    core_ratio_A: float = 0.5
+    lambda_pull_A: float = 1.0
+    lambda_sep_A: float = 0.1
+    lambda_pair_A: float = 0.1
+    core_ratio_B: float = 0.5
+    alpha_B: float = 1.0
+    beta_B: float = 1.0
+    gamma_B: float = 1.0
+    lambda_rec_B: float = 1.0
+    lambda_pull_B: float = 0.5
+    lambda_align_B: float = 0.05
+    lambda_delta_B: float = 0.05
+    lambda_anom_B: float = 0.05
+    margin_anom: float = 1.0
     negative_injection_profile: str = "default"
     stage2_relational_negative_p: float = 0.0
     stage2_relational_max_shift_ratio: float = 0.10
@@ -169,11 +189,13 @@ _COMMON_EXPLICIT: Dict[str, object] = {
     "dual_long_out": 16,
     "epoch_stage0": 10,
     "epoch_stage1": 10,
-    "epoch_stage2": 20,
+    "epoch_stage2": 6,
     "lr": 1e-3,
     "weight_decay": 1e-5,
-    "num_stage2_rounds": 4,
+    "num_stage2_rounds": 3,
     "epochs_per_stage2_round": 5,
+    "stage2_a_epochs": 1,
+    "stage2_b_epochs": 1,
     "stage2_method": "separate_proto",
     "prototype_mode": "separate",
     "state_dim": 0,
@@ -223,6 +245,24 @@ _COMMON_EXPLICIT: Dict[str, object] = {
     "lambda_ctx_stage1": 0.05,
     "stage1_positive_offset": 1,
     "stage1_positive_direction": "past",
+    "stage1_inject_context_len": 0,
+    "lambda_away_stage1": 0.05,
+    "margin_stage1": 1.0,
+    "stage2_inject_context_len": 0,
+    "core_ratio_A": 0.5,
+    "lambda_pull_A": 1.0,
+    "lambda_sep_A": 0.1,
+    "lambda_pair_A": 0.1,
+    "core_ratio_B": 0.5,
+    "alpha_B": 1.0,
+    "beta_B": 1.0,
+    "gamma_B": 1.0,
+    "lambda_rec_B": 1.0,
+    "lambda_pull_B": 0.5,
+    "lambda_align_B": 0.05,
+    "lambda_delta_B": 0.05,
+    "lambda_anom_B": 0.05,
+    "margin_anom": 1.0,
     "negative_injection_profile": "default",
     "stage2_relational_negative_p": 0.0,
     "stage2_relational_max_shift_ratio": 0.10,
@@ -252,7 +292,7 @@ _DATASET_PRESETS: Dict[str, Dict[str, object]] = {
         "use_attentive_pooling": True,
         "epoch_stage0": 10,
         "epoch_stage1": 10,
-        "epoch_stage2": 20,
+        "epoch_stage2": 6,
         "batch_size": 128,
         "seed": 42,
         "num_workers": 8,
@@ -272,7 +312,7 @@ _DATASET_PRESETS: Dict[str, Dict[str, object]] = {
         "use_attentive_pooling": True,
         "epoch_stage0": 10,
         "epoch_stage1": 10,
-        "epoch_stage2": 20,
+        "epoch_stage2": 6,
         "batch_size": 256,
         "seed": 42,
         "num_workers": 4,
@@ -292,7 +332,7 @@ _DATASET_PRESETS: Dict[str, Dict[str, object]] = {
         "use_attentive_pooling": True,
         "epoch_stage0": 10,
         "epoch_stage1": 10,
-        "epoch_stage2": 20,
+        "epoch_stage2": 6,
         "batch_size": 256,
         "seed": 42,
         "num_workers": 4,
@@ -312,7 +352,7 @@ _DATASET_PRESETS: Dict[str, Dict[str, object]] = {
         "use_attentive_pooling": True,
         "epoch_stage0": 10,
         "epoch_stage1": 10,
-        "epoch_stage2": 20,
+        "epoch_stage2": 6,
         "batch_size": 128,
         "seed": 42,
         "num_workers": 8,
@@ -332,7 +372,7 @@ _DATASET_PRESETS: Dict[str, Dict[str, object]] = {
         "use_attentive_pooling": True,
         "epoch_stage0": 10,
         "epoch_stage1": 10,
-        "epoch_stage2": 20,
+        "epoch_stage2": 6,
         "batch_size": 256,
         "seed": 42,
         "num_workers": 4,
@@ -352,7 +392,7 @@ _DATASET_PRESETS: Dict[str, Dict[str, object]] = {
         "use_attentive_pooling": True,
         "epoch_stage0": 10,
         "epoch_stage1": 10,
-        "epoch_stage2": 20,
+        "epoch_stage2": 6,
         "batch_size": 256,
         "seed": 42,
         "num_workers": 4,
@@ -372,7 +412,7 @@ _DATASET_PRESETS: Dict[str, Dict[str, object]] = {
         "use_attentive_pooling": True,
         "epoch_stage0": 10,
         "epoch_stage1": 10,
-        "epoch_stage2": 20,
+        "epoch_stage2": 6,
         "batch_size": 256,
         "seed": 42,
         "num_workers": 4,
@@ -422,18 +462,23 @@ _DATASET_META: Dict[str, Dict[str, object]] = {
 
 _STAGE2_METHOD_DEFAULTS: Dict[str, Dict[str, object]] = {
     "separate_proto": {
-        "lambda_state_consistency": 0.05,
-        "lambda_proto_pull": 0.2,
-        "q_joint_sharpen_temperature": 1.0,
-        "lambda_proto_usage_balance": 0.05,
-        "stage2_time_kmeans_mode": "last",
-        "stage2_time_core_dist_quantile": 0.8,
-        "stage2_proto_ema_update": True,
-        "stage2_proto_ema_decay": 0.95,
-        "stage2_proto_ema_min_tokens": 1,
-        "stage2_balanced_core": True,
-        "stage2_balanced_core_max_fraction": 0.35,
-        "stage2_balanced_core_min_per_proto": 16,
+        "num_stage2_rounds": 3,
+        "stage2_a_epochs": 1,
+        "stage2_b_epochs": 1,
+        "core_ratio_A": 0.5,
+        "lambda_pull_A": 1.0,
+        "lambda_sep_A": 0.1,
+        "lambda_pair_A": 0.1,
+        "core_ratio_B": 0.5,
+        "alpha_B": 1.0,
+        "beta_B": 1.0,
+        "gamma_B": 1.0,
+        "lambda_rec_B": 1.0,
+        "lambda_pull_B": 0.5,
+        "lambda_align_B": 0.05,
+        "lambda_delta_B": 0.05,
+        "lambda_anom_B": 0.05,
+        "margin_anom": 1.0,
     },
 }
 

@@ -28,20 +28,14 @@ def run_train_loop(solver):
     self._save_dual_truth_visualizations("stage0")
     self._trim_active_training_pool("stage0")
 
-    print("========== Stage A1: Unlabeled-train Latent Warmup ==========")
-    train_dataset_step = max(
-        1,
-        int(getattr(getattr(self, "full_train_dataset", self.train_loader.dataset), "step", 1)),
-    )
-    stage1_shift = int(getattr(self.config, "stage1_positive_offset", 1)) * train_dataset_step
+    print("========== Stage A1: Last-context Anomaly Separation ==========")
     print(
         "[StageA1] setup | "
-        "reconstruction=full_window_anchor | "
-        "context=neighbor_same_point | "
-        f"positive_direction={str(getattr(self.config, 'stage1_positive_direction', 'past'))} | "
-        f"positive_offset={int(getattr(self.config, 'stage1_positive_offset', 1))} | "
-        f"raw_shift={stage1_shift} | "
-        f"lambda_ctx={float(getattr(self.config, 'lambda_ctx_stage1', 0.05)):.3f}"
+        "reconstruction=full_window | "
+        "negative=inject_last_context | "
+        f"context_len={self._inject_context_len('stage1')} | "
+        f"lambda_away={float(getattr(self.config, 'lambda_away_stage1', 0.05)):.3f} | "
+        f"margin={float(getattr(self.config, 'margin_stage1', 1.0)):.3f}"
     )
     if self._is_dual_view_model():
         channels = int(getattr(self.config, "in_channels", 0))
@@ -75,42 +69,36 @@ def run_train_loop(solver):
     self._save_dual_truth_visualizations("stage1")
     self._trim_active_training_pool("stage1")
 
-    print("========== Stage 2: Prototype Refinement ==========")
-    num_stage2_rounds, epochs_per_round = self._resolve_stage2_schedule()
+    print("========== Stage 2: Prototype A/B Refinement ==========")
+    num_stage2_rounds, stage2_a_epochs, stage2_b_epochs = self._resolve_stage2_schedule()
     total_stage2_epochs = self._stage2_total_epochs()
     print(
         "[Stage2] setup | "
         f"method={self._stage2_method()} | "
         f"rounds={num_stage2_rounds} | "
-        f"epochs_per_round={epochs_per_round} | "
-        "refresh_unit=epoch | "
+        f"A_epochs={stage2_a_epochs} | "
+        f"B_epochs={stage2_b_epochs} | "
+        "schedule=Init->A->B | "
         f"num_prototypes={int(getattr(self.config, 'num_prototypes', 0))} | "
         f"state_dim={int(getattr(self.config, 'state_dim', 0))} | "
-        f"tau_conf={float(getattr(self.config, 'tau_conf', 0.7)):.3f} | "
-        f"time_core_summary={str(getattr(self.config, 'joint_core_mode', 'minimal'))} | "
         f"active_pool={self._active_pool_summary_text()} | "
-        f"lambda=(state={float(getattr(self.config, 'lambda_state_consistency', 1.0)):.3f}, "
-        f"pull={float(getattr(self.config, 'lambda_proto_pull', 1.0)):.3f}, "
-        f"injected_push={float(getattr(self.config, 'lambda_injected_push', 0.1)):.3f}, "
-        f"rec={float(getattr(self.config, 'stage2_lambda_rec', 0.0)):.3f}) | "
-        f"time_kmeans={str(getattr(self.config, 'stage2_time_kmeans_mode', 'last'))}:"
-        f"{int(getattr(self.config, 'stage2_time_kmeans_max_tokens', 200000))} | "
-        f"time_core_dist_q={float(getattr(self.config, 'stage2_time_core_dist_quantile', 0.8)):.3f} | "
-        f"proto_ema=(enabled={bool(getattr(self.config, 'stage2_proto_ema_update', True))}, "
-        f"decay={float(getattr(self.config, 'stage2_proto_ema_decay', 0.95)):.3f}) | "
-        f"proto_force=(lambda_sep={float(getattr(self.config, 'lambda_proto_separation', 0.3)):.3f}, "
-        f"margin={float(getattr(self.config, 'proto_separation_margin', 1.0)):.3f}, "
-        f"force={float(getattr(self.config, 'proto_separation_force_weight', 0.1)):.3f}) | "
-        f"anti_collapse=(usage={float(getattr(self.config, 'lambda_proto_usage_balance', 0.0)):.3f}, "
-        f"balanced_core={bool(getattr(self.config, 'stage2_balanced_core', False))}, "
-        f"max_core_frac={float(getattr(self.config, 'stage2_balanced_core_max_fraction', 1.0)):.3f}) | "
-        f"core_label_diag={bool(getattr(self.config, 'enable_joint_core_label_diagnostics', False))}"
+        f"A=(core={float(getattr(self.config, 'core_ratio_A', 0.5)):.3f}, "
+        f"pull={float(getattr(self.config, 'lambda_pull_A', 1.0)):.3f}, "
+        f"sep={float(getattr(self.config, 'lambda_sep_A', 0.1)):.3f}, "
+        f"pair={float(getattr(self.config, 'lambda_pair_A', 0.1)):.3f}) | "
+        f"B=(core={float(getattr(self.config, 'core_ratio_B', 0.5)):.3f}, "
+        f"rec={float(getattr(self.config, 'lambda_rec_B', 1.0)):.3f}, "
+        f"pull={float(getattr(self.config, 'lambda_pull_B', 0.5)):.3f}, "
+        f"align={float(getattr(self.config, 'lambda_align_B', 0.05)):.3f}, "
+        f"delta={float(getattr(self.config, 'lambda_delta_B', 0.05)):.3f}, "
+        f"anom={float(getattr(self.config, 'lambda_anom_B', 0.05)):.3f})"
     )
-    title = "Dual-View Separate Prototype Learning"
+    title = "Dual-View Aligned Prototype Learning"
     print(f"========== Stage 2 {title} ==========")
-    self._run_stage2_separate_proto_refinement(
+    self._run_stage2_ab_refinement(
         num_stage2_rounds=num_stage2_rounds,
-        epochs_per_round=epochs_per_round,
+        stage2_a_epochs=stage2_a_epochs,
+        stage2_b_epochs=stage2_b_epochs,
         total_stage2_epochs=total_stage2_epochs,
     )
 

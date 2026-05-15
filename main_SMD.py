@@ -12,8 +12,7 @@ LOCAL_CONFIG_OVERRIDES = {
     'dual_short_out': 24,
     'dual_long_out': 24,
     'num_prototypes': 10,
-    'stage2_balanced_core_max_fraction': 0.5,
-    'lambda_ctx_stage1': 0.05,
+    'lambda_away_stage1': 0.05,
     'decision_quantile': 0.913198959229,
 }
 

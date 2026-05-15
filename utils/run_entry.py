@@ -233,7 +233,6 @@ def _encoder_backbone_summary(config: Config) -> str:
 
 def print_train_summary(config: Config, run_dir: str, run_name: str, experiment_name: str):
     train_step, test_step = _resolved_window_steps(config)
-    stage1_shift = int(getattr(config, "stage1_positive_offset", 1)) * int(train_step)
     print(f"Results directory: {os.path.abspath(run_dir)}")
     print(f"Run name: {run_name}")
     print(f"Dataset: {config.dataset}")
@@ -272,32 +271,34 @@ def print_train_summary(config: Config, run_dir: str, run_name: str, experiment_
     )
     print(
         "Stage1: "
-        "mode=anchor_recon+neighbor_point_context | "
-        f"positive_direction={getattr(config, 'stage1_positive_direction', 'past')} | "
-        f"positive_offset={getattr(config, 'stage1_positive_offset', 1)} | "
-        f"raw_shift={stage1_shift} | "
-        f"lambda_ctx={getattr(config, 'lambda_ctx_stage1', 0.05)}"
+        "mode=full_recon+last_context_away | "
+        f"context_len={getattr(config, 'stage1_inject_context_len', 0) or getattr(config, 'dual_history_len', 20)} | "
+        f"lambda_away={getattr(config, 'lambda_away_stage1', 0.05)} | "
+        f"margin={getattr(config, 'margin_stage1', 1.0)}"
     )
     print(
         "Stage2: "
         f"method={getattr(config, 'stage2_method', 'separate_proto')} | "
         f"rounds={config.num_stage2_rounds if config.num_stage2_rounds > 0 else 'auto'} | "
-        f"epochs_per_round={config.epochs_per_stage2_round if config.epochs_per_stage2_round > 0 else 'auto'} | "
-        "refresh_unit=epoch | "
+        f"A_epochs={getattr(config, 'stage2_a_epochs', 1)} | "
+        f"B_epochs={getattr(config, 'stage2_b_epochs', 1)} | "
+        "schedule=Init->A->B | "
         f"num_prototypes={getattr(config, 'num_prototypes', 0)} | "
         f"state_dim={getattr(config, 'state_dim', 0)} | "
-        f"tau_conf={getattr(config, 'tau_conf', 0.7)} | "
-        f"joint_core={getattr(config, 'joint_core_mode', 'minimal')} | "
         f"active_pool_trim={getattr(config, 'active_pool_trim_enabled', False)} "
         f"(stage0={getattr(config, 'active_pool_trim_stage0_ratio', 0.0)}, "
         f"stage1={getattr(config, 'active_pool_trim_stage1_ratio', 0.0)})"
     )
     print(
         "Loss/Score: "
-        f"lambda=(stage2_rec={config.stage2_lambda_rec}, "
-        f"state={getattr(config, 'lambda_state_consistency', 1.0)}, "
-        f"pull={getattr(config, 'lambda_proto_pull', 1.0)}, "
-        f"repulse={getattr(config, 'lambda_proto_repulsion', 1.0)}) | "
+        f"A=(pull={getattr(config, 'lambda_pull_A', 1.0)}, "
+        f"sep={getattr(config, 'lambda_sep_A', 0.1)}, "
+        f"pair={getattr(config, 'lambda_pair_A', 0.1)}) | "
+        f"B=(rec={getattr(config, 'lambda_rec_B', 1.0)}, "
+        f"pull={getattr(config, 'lambda_pull_B', 0.5)}, "
+        f"align={getattr(config, 'lambda_align_B', 0.05)}, "
+        f"delta={getattr(config, 'lambda_delta_B', 0.05)}, "
+        f"anom={getattr(config, 'lambda_anom_B', 0.05)}) | "
         f"js={getattr(config, 'lambda_js_score', 1.0)} | "
         f"proto_recon={getattr(config, 'prototype_recon_weight', 0.5)} | "
         f"threshold_q={config.decision_quantile}"

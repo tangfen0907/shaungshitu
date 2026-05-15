@@ -12,12 +12,9 @@ LOCAL_CONFIG_OVERRIDES = {
     'dual_short_out': 8,
     'dual_long_out': 8,
     'num_prototypes': 5,
-    'lambda_state_consistency': 1.0,
-    'lambda_proto_relation_consistency': 0.05,
-    'stage2_balanced_core_max_fraction': 0.5,
     'cache_windows': True,
     'device': 'cuda',
-    'lambda_ctx_stage1': 0.05,
+    'lambda_away_stage1': 0.05,
     'decision_quantile': 0.8,
     'visualization_method': 'pca',
 }

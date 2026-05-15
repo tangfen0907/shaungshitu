@@ -11,9 +11,8 @@ LOCAL_CONFIG_OVERRIDES = {
     'dual_current_out': 16,
     'dual_short_out': 32,
     'dual_long_out': 32,
-    'stage2_balanced_core_max_fraction': 0.5,
     'cache_windows': True,
-    'lambda_ctx_stage1': 0.05,
+    'lambda_away_stage1': 0.05,
     'decision_quantile': 0.948255688466,
     'visualization_method': 'pca',
 }

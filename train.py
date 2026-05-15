@@ -43,7 +43,6 @@ def build_common_preset_overrides(
         "dual_view_feature_mode",
         "joint_core_mode",
         "scaler_fit_mode",
-        "stage1_positive_direction",
         "stage2_method",
         "tcn_activation",
         "test_split_mode",
@@ -162,8 +161,28 @@ TRAIN_OVERRIDE_KEYS = [
     "lambda_ctx_stage1",
     "stage1_positive_offset",
     "stage1_positive_direction",
+    "stage1_inject_context_len",
+    "lambda_away_stage1",
+    "margin_stage1",
     "num_stage2_rounds",
     "epochs_per_stage2_round",
+    "stage2_a_epochs",
+    "stage2_b_epochs",
+    "stage2_inject_context_len",
+    "core_ratio_A",
+    "lambda_pull_A",
+    "lambda_sep_A",
+    "lambda_pair_A",
+    "core_ratio_B",
+    "alpha_B",
+    "beta_B",
+    "gamma_B",
+    "lambda_rec_B",
+    "lambda_pull_B",
+    "lambda_align_B",
+    "lambda_delta_B",
+    "lambda_anom_B",
+    "margin_anom",
     "stage2_lambda_rec",
     "decision_quantile",
     "enable_stage_visualization",
@@ -281,9 +300,29 @@ def build_parser(
     parser.add_argument("--lambda_ctx_stage1", type=float, default=None)
     parser.add_argument("--stage1_positive_offset", type=int, default=None)
     parser.add_argument("--stage1_positive_direction", type=str, default=None)
+    parser.add_argument("--stage1_inject_context_len", type=int, default=None)
+    parser.add_argument("--lambda_away_stage1", type=float, default=None)
+    parser.add_argument("--margin_stage1", type=float, default=None)
 
     parser.add_argument("--num_stage2_rounds", type=int, default=None)
     parser.add_argument("--epochs_per_stage2_round", type=int, default=None)
+    parser.add_argument("--stage2_a_epochs", type=int, default=None)
+    parser.add_argument("--stage2_b_epochs", type=int, default=None)
+    parser.add_argument("--stage2_inject_context_len", type=int, default=None)
+    parser.add_argument("--core_ratio_A", type=float, default=None)
+    parser.add_argument("--lambda_pull_A", type=float, default=None)
+    parser.add_argument("--lambda_sep_A", type=float, default=None)
+    parser.add_argument("--lambda_pair_A", type=float, default=None)
+    parser.add_argument("--core_ratio_B", type=float, default=None)
+    parser.add_argument("--alpha_B", type=float, default=None)
+    parser.add_argument("--beta_B", type=float, default=None)
+    parser.add_argument("--gamma_B", type=float, default=None)
+    parser.add_argument("--lambda_rec_B", type=float, default=None)
+    parser.add_argument("--lambda_pull_B", type=float, default=None)
+    parser.add_argument("--lambda_align_B", type=float, default=None)
+    parser.add_argument("--lambda_delta_B", type=float, default=None)
+    parser.add_argument("--lambda_anom_B", type=float, default=None)
+    parser.add_argument("--margin_anom", type=float, default=None)
     parser.add_argument("--stage2_lambda_rec", type=float, default=None)
     parser.add_argument("--decision_quantile", type=float, default=None)
 

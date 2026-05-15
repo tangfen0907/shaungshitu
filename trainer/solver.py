@@ -510,7 +510,7 @@ def _attach_solver_methods():
         "run_evaluation",
         "run_stage0_epoch",
         "run_stage1_epoch",
-        "run_stage2_separate_proto_refinement",
+        "run_stage2_ab_refinement",
     }
     for module in modules:
         for name in getattr(module, "__all__", ()): 
