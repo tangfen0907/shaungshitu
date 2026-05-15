@@ -4,7 +4,9 @@ import torch.nn as nn
 
 class Reconstructor(nn.Module):
     """
-    Decode a window-level latent vector into the raw-window target space.
+    Decode either:
+        - legacy window-level latent vectors [B, D] into [B, C, output_len]
+        - point-level latent sequences [B, T, D] into [B, T, C]
     """
 
     def __init__(
@@ -25,17 +27,24 @@ class Reconstructor(nn.Module):
         self.seq_len = seq_len
         self.output_len = int(output_len)
 
-        self.decoder = nn.Sequential(
+        self.window_decoder = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim * 2),
             nn.GELU(),
             nn.Linear(hidden_dim * 2, self.out_channels * self.output_len),
         )
+        self.point_decoder = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, self.out_channels),
+        )
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        if z.dim() != 2:
-            raise ValueError(f"Reconstructor expects [B, D], got {tuple(z.shape)}")
+        if z.dim() == 2:
+            x_hat = self.window_decoder(z)
+            return x_hat.view(z.size(0), self.out_channels, self.output_len)
+        if z.dim() == 3:
+            return self.point_decoder(z)
 
-        x_hat = self.decoder(z)
-        return x_hat.view(z.size(0), self.out_channels, self.output_len)
+        raise ValueError(f"Reconstructor expects [B, D] or [B, T, D], got {tuple(z.shape)}")

@@ -8,7 +8,7 @@ from typing import Dict, Optional
 import torch
 
 from trainer.solver import Solver
-from utils.config import Config, apply_stage2_method_defaults
+from utils.config import Config, apply_model_defaults, apply_stage2_method_defaults
 from utils.io_utils import save_config_artifact, save_result_artifacts
 
 
@@ -110,6 +110,7 @@ def merge_configs(base_config: Config, overrides: Optional[Dict[str, object]] = 
     if overrides:
         merged.update(dict(overrides))
     merged = apply_stage2_method_defaults(merged, explicit_overrides=overrides)
+    merged = apply_model_defaults(merged)
     return Config.from_dict(merged)
 
 
@@ -198,13 +199,21 @@ def _resolved_window_steps(config: Config):
 def _encoder_config_summary(config: Config) -> str:
     active_view = str(getattr(config, "active_view", "v1")).strip().lower()
     if active_view == "dual":
+        channels = int(getattr(config, "in_channels", 0))
+        history_len = int(getattr(config, "dual_history_len", 20))
+        current_out = int(getattr(config, "dual_current_out", 8))
+        short_out = int(getattr(config, "dual_short_out", 16))
+        long_out = int(getattr(config, "dual_long_out", 16))
+        view1_dim = 3 * channels + history_len
+        view2_dim = current_out + short_out + long_out
         return (
-            "patch_kernels=(3,5,7) | patch_blocks=3 | axis_dilation=1 | "
-            f"patch=({getattr(config, 'patch_len', 16)}, stride={getattr(config, 'patch_stride', 8)}) | "
-            f"readout={getattr(config, 'readout_mode', 'attn_topk_max')} | "
-            f"topk_ratio={getattr(config, 'topk_ratio', 0.1)} | "
-            f"topk_k={getattr(config, 'topk_k', 0)} | "
-            "v2_first_kernel=legacy_flatten_only"
+            "pointwise_dual | "
+            f"L={history_len} | "
+            f"view1_dim={view1_dim} | "
+            f"view2_out=({current_out},{short_out},{long_out})"
+            f"->{view2_dim} | "
+            f"view2_kernels=({channels},{(history_len // 2) * channels},{history_len * channels}) | "
+            "reconstruction=full_window"
         )
     return (
         f"tcn_kernel={getattr(config, 'tcn_kernel_size', 3)} | "
@@ -212,8 +221,19 @@ def _encoder_config_summary(config: Config) -> str:
     )
 
 
+def _encoder_backbone_summary(config: Config) -> str:
+    active_view = str(getattr(config, "active_view", "v1")).strip().lower()
+    if active_view == "dual":
+        return f"d_model={getattr(config, 'latent_dim', 0)}"
+    return (
+        f"tcn_layers={config.tcn_layers} | "
+        f"latent_dim={config.latent_dim}"
+    )
+
+
 def print_train_summary(config: Config, run_dir: str, run_name: str, experiment_name: str):
     train_step, test_step = _resolved_window_steps(config)
+    stage1_shift = int(getattr(config, "stage1_positive_offset", 1)) * int(train_step)
     print(f"Results directory: {os.path.abspath(run_dir)}")
     print(f"Run name: {run_name}")
     print(f"Dataset: {config.dataset}")
@@ -235,11 +255,9 @@ def print_train_summary(config: Config, run_dir: str, run_name: str, experiment_
         f"in_channels={config.in_channels} | "
         f"active_view={getattr(config, 'active_view', 'v1')} | "
         f"dual_feature={getattr(config, 'dual_view_feature_mode', 'avg')} | "
-        f"lambda_cv=({getattr(config, 'lambda_cv_stage0', 0.0)}, {getattr(config, 'lambda_cv_stage1', 0.0)}, {getattr(config, 'lambda_cv_stage2', 0.0)}) | "
         f"dual_view_evidence=(center={getattr(config, 'dual_view_center_weight', 1.0)}, recon={getattr(config, 'dual_view_recon_weight', 0.5)}) | "
-        f"tcn_layers={config.tcn_layers} | "
         f"{_encoder_config_summary(config)} | "
-        f"latent_dim={config.latent_dim}"
+        f"{_encoder_backbone_summary(config)}"
     )
     print(
         "Training: "
@@ -254,14 +272,11 @@ def print_train_summary(config: Config, run_dir: str, run_name: str, experiment_
     )
     print(
         "Stage1: "
-        f"injected_triplet={getattr(config, 'stage1_use_injected_triplet', False)} | "
+        "mode=anchor_recon+neighbor_point_context | "
         f"positive_direction={getattr(config, 'stage1_positive_direction', 'past')} | "
         f"positive_offset={getattr(config, 'stage1_positive_offset', 1)} | "
-        f"lambda_triplet={getattr(config, 'lambda_stage1_triplet', 1.0)} | "
-        f"triplet_margin={getattr(config, 'stage1_triplet_margin', 1.0)} | "
-        f"negative_profile={getattr(config, 'negative_injection_profile', 'default')} | "
-        f"rel_stage1_p={getattr(config, 'stage1_relational_negative_p', 0.0)} | "
-        f"rel_stage2_p={getattr(config, 'stage2_relational_negative_p', 0.0)}"
+        f"raw_shift={stage1_shift} | "
+        f"lambda_ctx={getattr(config, 'lambda_ctx_stage1', 0.05)}"
     )
     print(
         "Stage2: "
@@ -282,8 +297,7 @@ def print_train_summary(config: Config, run_dir: str, run_name: str, experiment_
         f"lambda=(stage2_rec={config.stage2_lambda_rec}, "
         f"state={getattr(config, 'lambda_state_consistency', 1.0)}, "
         f"pull={getattr(config, 'lambda_proto_pull', 1.0)}, "
-        f"repulse={getattr(config, 'lambda_proto_repulsion', 1.0)}, "
-        f"cv_stage2={getattr(config, 'lambda_cv_stage2', 0.0)}) | "
+        f"repulse={getattr(config, 'lambda_proto_repulsion', 1.0)}) | "
         f"js={getattr(config, 'lambda_js_score', 1.0)} | "
         f"proto_recon={getattr(config, 'prototype_recon_weight', 0.5)} | "
         f"threshold_q={config.decision_quantile}"
@@ -320,11 +334,9 @@ def print_eval_summary(
         f"in_channels={config.in_channels} | "
         f"active_view={getattr(config, 'active_view', 'v1')} | "
         f"dual_feature={getattr(config, 'dual_view_feature_mode', 'avg')} | "
-        f"lambda_cv=({getattr(config, 'lambda_cv_stage0', 0.0)}, {getattr(config, 'lambda_cv_stage1', 0.0)}, {getattr(config, 'lambda_cv_stage2', 0.0)}) | "
         f"dual_view_evidence=(center={getattr(config, 'dual_view_center_weight', 1.0)}, recon={getattr(config, 'dual_view_recon_weight', 0.5)}) | "
-        f"tcn_layers={config.tcn_layers} | "
         f"{_encoder_config_summary(config)} | "
-        f"latent_dim={config.latent_dim}"
+        f"{_encoder_backbone_summary(config)}"
     )
     print(
         "Evaluation: "

@@ -111,11 +111,12 @@ class Solver:
             ),
             proto_temperature=float(getattr(self.config, "proto_temperature", 0.2)),
             stage2_method=str(getattr(self.config, "stage2_method", "separate_proto")),
-            readout_mode=str(getattr(self.config, "readout_mode", "attn_topk_max")),
             topk_ratio=float(getattr(self.config, "topk_ratio", 0.1)),
             topk_k=int(getattr(self.config, "topk_k", 0)),
-            patch_len=int(getattr(self.config, "patch_len", 16)),
-            patch_stride=int(getattr(self.config, "patch_stride", 8)),
+            dual_history_len=int(getattr(self.config, "dual_history_len", 20)),
+            dual_current_out=int(getattr(self.config, "dual_current_out", 8)),
+            dual_short_out=int(getattr(self.config, "dual_short_out", 16)),
+            dual_long_out=int(getattr(self.config, "dual_long_out", 16)),
         ).to(self.device)
 
         self.optimizer = Adam(
@@ -138,8 +139,6 @@ class Solver:
         self.bank_summary: List[Dict[str, object]] = []
         self.cluster_bank = None
         self.current_stage2_view = "v1"
-        self.stage1_real_anomaly_indices = self._build_stage1_real_anomaly_index_pool()
-
         os.makedirs(self.config.save_dir, exist_ok=True)
 
     def _build_device(self) -> torch.device:
@@ -301,6 +300,8 @@ class Solver:
         window = _to_channel_first_tensor(sample)
         self.config.in_channels = int(window.shape[0])
         self.config.seq_len = int(window.shape[1])
+        if int(getattr(self.config, "state_dim", 0)) <= 0:
+            self.config.state_dim = int(getattr(self.config, "latent_dim", 0))
 
     def _prepare_batch(self, batch) -> torch.Tensor:
         x = _extract_window(batch)
@@ -358,6 +359,38 @@ class Solver:
             return self._v2_last_timestep(x_hat)
         return self._last_timestep(x_hat)
 
+    def _uses_full_window_reconstruction(
+        self,
+        x_hat: torch.Tensor,
+        target: torch.Tensor,
+        view: Optional[str] = None,
+    ) -> bool:
+        if self._uses_legacy_v2_reconstruction(view):
+            return False
+        if self._is_dual_view_model():
+            return True
+        return tuple(x_hat.shape) == tuple(target.shape)
+
+    def _target_for_reconstruction(
+        self,
+        x_hat: torch.Tensor,
+        target: torch.Tensor,
+        view: Optional[str] = None,
+    ) -> torch.Tensor:
+        if self._uses_full_window_reconstruction(x_hat, target, view):
+            return target
+        return self._target_last_for_view(target, view)
+
+    def _prediction_for_reconstruction(
+        self,
+        x_hat: torch.Tensor,
+        target: torch.Tensor,
+        view: Optional[str] = None,
+    ) -> torch.Tensor:
+        if self._uses_full_window_reconstruction(x_hat, target, view):
+            return x_hat
+        return self._prediction_last_for_view(x_hat, view)
+
     def _reconstruction_loss(
         self,
         x_hat: torch.Tensor,
@@ -365,8 +398,8 @@ class Solver:
         view: Optional[str] = None,
     ) -> torch.Tensor:
         return self.recon_loss_fn(
-            self._prediction_last_for_view(x_hat, view),
-            self._target_last_for_view(target, view),
+            self._prediction_for_reconstruction(x_hat, target, view),
+            self._target_for_reconstruction(x_hat, target, view),
         )
 
     def _mse_per_sample(
@@ -375,7 +408,10 @@ class Solver:
         x_hat: torch.Tensor,
         view: Optional[str] = None,
     ) -> torch.Tensor:
-        error = (self._target_last_for_view(x, view) - self._prediction_last_for_view(x_hat, view)) ** 2
+        error = (
+            self._target_for_reconstruction(x_hat, x, view)
+            - self._prediction_for_reconstruction(x_hat, x, view)
+        ) ** 2
         return torch.mean(error, dim=(1, 2))
 
     def _mse_per_sample_from_outputs(
@@ -397,26 +433,6 @@ class Solver:
             view=self._normalize_reconstruction_view(),
         )
 
-    def _build_stage1_masked_input(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        mask = torch.zeros_like(x, dtype=torch.bool)
-        batch_size, num_channels, length = x.shape
-
-        time_ratio = min(max(float(getattr(self.config, "stage1_mask_ratio_time", 0.0)), 0.0), 1.0)
-        if time_ratio > 0.0:
-            time_mask = torch.rand(batch_size, 1, length, device=x.device) < time_ratio
-            mask = mask | time_mask.expand(-1, num_channels, -1)
-
-        num_mask_channels = max(0, int(getattr(self.config, "stage1_mask_num_channels", 0)))
-        num_mask_channels = min(num_mask_channels, num_channels)
-        if num_mask_channels > 0:
-            for batch_idx in range(batch_size):
-                channel_idx = torch.randperm(num_channels, device=x.device)[:num_mask_channels]
-                mask[batch_idx, channel_idx, :] = True
-
-        masked_x = x.clone()
-        masked_x[mask] = 0.0
-        return masked_x, mask
-
     def _stage1_reconstruction_loss(
         self,
         x_hat: torch.Tensor,
@@ -424,18 +440,6 @@ class Solver:
         mask: Optional[torch.Tensor] = None,
         view: Optional[str] = None,
     ) -> torch.Tensor:
-        if (
-            mask is not None
-            and bool(getattr(self.config, "stage1_recon_loss_on_mask_only", True))
-            and bool(mask.any())
-        ):
-            last_mask = self._target_last_for_view(mask, view).bool()
-            if bool(last_mask.any()):
-                error = (
-                    self._prediction_last_for_view(x_hat, view)
-                    - self._target_last_for_view(target, view)
-                ) ** 2
-                return error[last_mask].mean()
         return self._reconstruction_loss(x_hat, target, view=view)
 
     def _reconstruction_loss_from_outputs(
@@ -476,29 +480,6 @@ class Solver:
             self._stage1_reconstruction_loss(outputs["x_hat1"], target, mask, view="v1"),
             self._stage1_reconstruction_loss(outputs["x_hat2"], target, mask, view="v2"),
         )
-
-    def _cross_view_consistency_loss(
-        self,
-        outputs: Dict[str, torch.Tensor],
-        target: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        if "z1" not in outputs or "z2" not in outputs:
-            reference = outputs.get("z")
-            if reference is None:
-                return torch.zeros((), device=self.device)
-            return torch.zeros((), device=reference.device, dtype=reference.dtype)
-        return torch.mean((outputs["z1"] - outputs["z2"]) ** 2)
-
-    def _stage1_triplet_embedding_loss(
-        self,
-        z_anchor: torch.Tensor,
-        z_positive: torch.Tensor,
-        z_negative: torch.Tensor,
-    ) -> torch.Tensor:
-        d_ap_sq = torch.sum((z_anchor - z_positive) ** 2, dim=1)
-        d_an = torch.sqrt(torch.sum((z_anchor - z_negative) ** 2, dim=1) + 1e-12)
-        margin = float(getattr(self.config, "stage1_triplet_margin", 1.0))
-        return (d_ap_sq + torch.relu(margin - d_an) ** 2).mean()
 
     def _is_dual_view_model(self) -> bool:
         return bool(getattr(self.model, "is_dual_view", False))

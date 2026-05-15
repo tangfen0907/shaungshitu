@@ -5,13 +5,15 @@ RUN_NAME = 'smd_experiment'
 LOCAL_CONFIG_OVERRIDES = {
     'dataset': 'SMD',
     'data_path': 'dataset/SMD',
-    'v2_first_kernel_size': 3,
     'active_view': 'dual',
-    'state_dim': 64,
+    'latent_dim': 160,
+    'dual_history_len': 20,
+    'dual_current_out': 16,
+    'dual_short_out': 24,
+    'dual_long_out': 24,
     'num_prototypes': 10,
     'stage2_balanced_core_max_fraction': 0.5,
-    'stage1_use_injected_triplet': True,
-    'stage1_triplet_margin': 0.3,
+    'lambda_ctx_stage1': 0.05,
     'decision_quantile': 0.913198959229,
 }
 

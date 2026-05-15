@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from model.axis_view_encoder import PatchRelationDualEncoder
+from model.axis_view_encoder import PointwiseDualEncoder
 from model.prototype_head import DualViewPrototypeHeads, PrototypeHead
 from model.reconstructor import Reconstructor
 from model.svdd_head import MultiCenterSVDD
@@ -14,8 +14,9 @@ from model.tcn_encoder import TCNEncoder
 class AnomalyDetector(nn.Module):
     """Top-level anomaly detector.
 
-    Dual-view mode uses independent View1/View2 prototype heads. The
-    compatibility global z remains for the existing training/evaluation flow.
+    Dual-view mode uses point-level View1/View2 encodings and independent
+    reconstruction heads. The compatibility global z remains for the existing
+    training/evaluation flow.
     """
 
     def __init__(
@@ -36,11 +37,12 @@ class AnomalyDetector(nn.Module):
         num_prototypes: int = 1,
         proto_temperature: float = 0.2,
         stage2_method: str = "separate_proto",
-        readout_mode: str = "attn_topk_max",
         topk_ratio: float = 0.1,
         topk_k: int = 0,
-        patch_len: int = 16,
-        patch_stride: int = 8,
+        dual_history_len: int = 20,
+        dual_current_out: int = 8,
+        dual_short_out: int = 16,
+        dual_long_out: int = 16,
     ):
         super().__init__()
         self.gravity_tau = gravity_tau
@@ -51,11 +53,12 @@ class AnomalyDetector(nn.Module):
         self.is_dual_view = self.active_view == "dual"
         self.tcn_kernel_size = int(tcn_kernel_size)
         self.v2_first_kernel_size = int(v2_first_kernel_size)
-        self.readout_mode = str(readout_mode or "attn_topk_max").strip().lower()
         self.topk_ratio = float(topk_ratio)
         self.topk_k = int(topk_k)
-        self.patch_len = max(1, int(patch_len))
-        self.patch_stride = max(1, int(patch_stride))
+        self.dual_history_len = max(1, int(dual_history_len))
+        self.dual_current_out = max(1, int(dual_current_out))
+        self.dual_short_out = max(1, int(dual_short_out))
+        self.dual_long_out = max(1, int(dual_long_out))
         self.state_dim = int(state_dim) if int(state_dim) > 0 else int(latent_dim)
         if self.state_dim != int(latent_dim):
             raise ValueError(
@@ -69,26 +72,15 @@ class AnomalyDetector(nn.Module):
         if self.is_dual_view:
             self.encoder_in_channels = self.raw_in_channels
             self.encoder_seq_len = self.raw_seq_len
-            axis_kernels = (3, 5, 7)
-            axis_num_blocks = 3
-            self.encoder_v1_dilations = tuple(1 for _ in range(axis_num_blocks))
-            self.encoder_v2_dilations = tuple(1 for _ in range(axis_num_blocks))
-            self.encoder_v1_kernel_sizes = axis_kernels
-            self.encoder_v2_kernel_sizes = axis_kernels
-            self.dual_encoder = PatchRelationDualEncoder(
-                latent_dim=latent_dim,
-                tcn_layers=tcn_layers,
-                patch_len=self.patch_len,
-                patch_stride=self.patch_stride,
-                patch_blocks=axis_num_blocks,
-                relation_layers=1,
-                relation_heads=4,
-                kernels=axis_kernels,
+            self.dual_encoder = PointwiseDualEncoder(
+                in_channels=self.raw_in_channels,
+                d_model=latent_dim,
+                history_len=self.dual_history_len,
+                current_out=self.dual_current_out,
+                short_out=self.dual_short_out,
+                long_out=self.dual_long_out,
                 dropout=dropout,
                 activation=tcn_activation,
-                readout=self.readout_mode,
-                topk_ratio=self.topk_ratio,
-                topk_k=self.topk_k,
             )
             self.encoder_v2_in_channels = self.raw_in_channels
             self.encoder_v2_seq_len = self.raw_seq_len
@@ -100,19 +92,7 @@ class AnomalyDetector(nn.Module):
             self.reconstructor_v2 = Reconstructor(
                 latent_dim=latent_dim,
                 out_channels=self.raw_in_channels,
-                output_len=1,
                 hidden_dim=max(128, latent_dim * 2),
-            )
-            patch_token_dim = int(tuple(tcn_layers)[0])
-            self.patch_value_projector_v1 = (
-                nn.Identity()
-                if patch_token_dim == self.state_dim
-                else nn.Linear(patch_token_dim, self.state_dim)
-            )
-            self.patch_value_projector_v2 = (
-                nn.Identity()
-                if patch_token_dim == self.state_dim
-                else nn.Linear(patch_token_dim, self.state_dim)
             )
             self._time_proto_shape_logged = False
         elif self.active_view == "v1":
@@ -296,30 +276,6 @@ class AnomalyDetector(nn.Module):
             return x.transpose(1, 2).reshape(batch_size, 1, x.size(1) * x.size(2)).contiguous()
         raise ValueError(f"Unsupported view: {view}")
 
-    def _v2_last_to_raw_layout(self, x_hat_v2: torch.Tensor) -> torch.Tensor:
-        if (
-            x_hat_v2.dim() == 3
-            and x_hat_v2.size(1) == self.raw_in_channels
-            and x_hat_v2.size(2) == 1
-        ):
-            return x_hat_v2
-        # TODO: remove this legacy [B, 1, C] branch after old v2_flatten
-        # configs/checkpoints are no longer needed.
-        if x_hat_v2.dim() == 3 and x_hat_v2.size(1) == 1 and x_hat_v2.size(2) == self.raw_in_channels:
-            return x_hat_v2.transpose(1, 2).contiguous()
-        raise ValueError(
-            "V2 reconstruction should be raw [B, C, 1] or legacy [B, 1, C], "
-            f"got {tuple(x_hat_v2.shape)}."
-        )
-
-    def _legacy_v2_to_raw_layout(self, x_hat_v2: torch.Tensor) -> torch.Tensor:
-        if x_hat_v2.dim() != 3 or x_hat_v2.size(1) != 1 or x_hat_v2.size(2) != self.raw_in_channels:
-            raise ValueError(
-                "V2 reconstruction should be [B, 1, C] before converting to raw layout, "
-                f"got {tuple(x_hat_v2.shape)}."
-            )
-        return x_hat_v2.transpose(1, 2).contiguous()
-
     def _combine_dual_features(self, z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
         if self.dual_view_feature_mode == "v1":
             return z1
@@ -332,7 +288,7 @@ class AnomalyDetector(nn.Module):
             z = self.encode(x)
             return z, z
         features = self.dual_encoder(x)
-        return features["z1_global"], features["z2_global"]
+        return features["H1"][:, -1, :], features["H2"][:, -1, :]
 
     def project_state(self, z: torch.Tensor, view: str = None) -> torch.Tensor:
         if not self.is_dual_view:
@@ -404,32 +360,6 @@ class AnomalyDetector(nn.Module):
             return self.reconstructor_v2(z)
         raise ValueError("view should be 'v1' or 'v2'.")
 
-    def _patch_tokens_to_time(
-        self,
-        h_patch: torch.Tensor,
-        projector: nn.Module,
-        length: int,
-    ) -> torch.Tensor:
-        if h_patch.dim() != 4:
-            raise ValueError(f"patch-to-time expects [B, N, P, D], got {tuple(h_patch.shape)}")
-        batch_size, num_variables, patch_count, _ = h_patch.shape
-        length = max(1, int(length))
-        patch_values = projector(h_patch)
-        if patch_values.size(-1) != self.state_dim:
-            raise ValueError(
-                f"patch-to-time expected projected D={self.state_dim}, got {int(patch_values.size(-1))}."
-            )
-        time_values = h_patch.new_zeros(batch_size, num_variables, length, self.state_dim)
-        counts = h_patch.new_zeros(length)
-        for patch_idx in range(patch_count):
-            start = int(patch_idx) * self.patch_stride
-            if start >= length:
-                continue
-            end = min(start + self.patch_len, length)
-            time_values[:, :, start:end, :] = time_values[:, :, start:end, :] + patch_values[:, :, patch_idx, :].unsqueeze(2)
-            counts[start:end] = counts[start:end] + 1.0
-        return time_values / counts.clamp_min(1.0).view(1, 1, length, 1)
-
     def _time_topk_mean(self, time_dist: torch.Tensor) -> torch.Tensor:
         if time_dist.dim() < 2:
             return time_dist.reshape(time_dist.size(0), -1).mean(dim=1)
@@ -450,15 +380,16 @@ class AnomalyDetector(nn.Module):
         """Return reconstruction and optional prototype outputs for the requested stage."""
         if self.is_dual_view:
             dual_features = self.dual_encoder(x)
-            z1 = dual_features["z1_global"]
-            z2 = dual_features["z2_global"]
+            H1 = dual_features["H1"]
+            H2 = dual_features["H2"]
+            z1 = H1[:, -1, :]
+            z2 = H2[:, -1, :]
             z = self._combine_dual_features(z1, z2)
-            x_hat1 = self.reconstructor_v1(z1)
-            x_hat2 = self.reconstructor_v2(z2)
-            # New axis-view V2 reconstructs the final multivariate state in
-            # the same raw layout as V1: [B, C, 1].
-            x_hat2_raw = self._v2_last_to_raw_layout(x_hat2)
-            x_hat = 0.5 * (x_hat1 + x_hat2_raw)
+            x_hat1_time = self.reconstructor_v1(H1)
+            x_hat2_time = self.reconstructor_v2(H2)
+            x_hat1 = x_hat1_time.transpose(1, 2).contiguous()
+            x_hat2 = x_hat2_time.transpose(1, 2).contiguous()
+            x_hat = 0.5 * (x_hat1 + x_hat2)
         else:
             z = self.encode(x)
             x_hat = self.reconstruct(z)
@@ -472,24 +403,20 @@ class AnomalyDetector(nn.Module):
                 {
                     "z1": z1,
                     "z2": z2,
+                    "H1": H1,
+                    "H2": H2,
+                    "F1": dual_features["F1"],
+                    "F2": dual_features["F2"],
+                    "x_flat": dual_features["x_flat"],
                     "x_hat1": x_hat1,
                     "x_hat2": x_hat2,
-                    "x_hat2_raw": x_hat2_raw,
-                    "h1_patch": dual_features["h1_patch"],
-                    "h2_input_patch": dual_features["h2_input_patch"],
-                    "h2_var": dual_features["h2_var"],
-                    "h2_patch": dual_features["h2_patch"],
                 }
             )
 
         if stage in {"stage2", "test", "separate_proto"}:
             if self.is_dual_view:
-                h1_patch = dual_features["h1_patch"]
-                h2_patch = dual_features["h2_patch"]
-                h1_time_var = self._patch_tokens_to_time(h1_patch, self.patch_value_projector_v1, x.size(-1))
-                h2_time_var = self._patch_tokens_to_time(h2_patch, self.patch_value_projector_v2, x.size(-1))
-                u1_time = h1_time_var.mean(dim=1)
-                u2_time = h2_time_var.mean(dim=1)
+                u1_time = H1
+                u2_time = H2
                 proto1 = self.prototype_head_v1(u1_time, detach_prototypes=detach_prototypes)
                 proto2 = self.prototype_head_v2(u2_time, detach_prototypes=detach_prototypes)
                 q1 = proto1["q"].mean(dim=1)
@@ -503,8 +430,7 @@ class AnomalyDetector(nn.Module):
                 if not self._time_proto_shape_logged:
                     print(
                         "[Stage2-TimeProto] forward shapes | "
-                        f"h1_patch={tuple(h1_patch.shape)} | "
-                        f"h1_time_var={tuple(h1_time_var.shape)} | "
+                        f"H1={tuple(H1.shape)} | "
                         f"u1_time={tuple(u1_time.shape)} | "
                         f"q1_time={tuple(proto1['q'].shape)} | "
                         f"proto_dist1_time={tuple(proto1['min_dist'].shape)} | "
@@ -516,8 +442,6 @@ class AnomalyDetector(nn.Module):
                     {
                         "u1": u1,
                         "u2": u2,
-                        "h1_time_var": h1_time_var,
-                        "h2_time_var": h2_time_var,
                         "u1_time": u1_time,
                         "u2_time": u2_time,
                         "q1": q1,

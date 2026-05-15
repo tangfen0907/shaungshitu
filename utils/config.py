@@ -24,22 +24,19 @@ class Config:
     tcn_layers: Tuple[int, ...] = (64, 128, 128)
     latent_dim: int = 64
     tcn_kernel_size: int = 3
-    # Legacy flatten-view V2 only. The axis-view dual encoder uses ordinary
-    # same-padded Conv1d blocks with kernel_size=7 and dilation=1.
+    # Legacy single-view flatten path only.
     v2_first_kernel_size: int = 0
     tcn_dropout: float = 0.1
     tcn_activation: str = "relu"
     use_attentive_pooling: bool = False
-    readout_mode: str = "attn_topk_max"
     topk_ratio: float = 0.1
     topk_k: int = 0
-    patch_len: int = 16
-    patch_stride: int = 8
+    dual_history_len: int = 20
+    dual_current_out: int = 8
+    dual_short_out: int = 16
+    dual_long_out: int = 16
     active_view: str = "v1"
     dual_view_feature_mode: str = "avg"
-    lambda_cv_stage0: float = 0.0
-    lambda_cv_stage1: float = 0.20
-    lambda_cv_stage2: float = 0.0
     dual_score_weight_v1: float = 1.0
     dual_score_weight_v2: float = 1.0
     dual_score_weight_cv: float = 1.0
@@ -113,27 +110,16 @@ class Config:
     pin_memory: bool = True
     enable_tf32: bool = True
     cudnn_benchmark: bool = True
-    stage1_use_masked_reconstruction: bool = False
-    stage1_mask_ratio_time: float = 0.15
-    stage1_mask_num_channels: int = 0
-    stage1_recon_loss_on_mask_only: bool = True
-    stage1_use_injected_triplet: bool = False
-    stage1_triplet_margin: float = 1.0
-    lambda_stage1_triplet: float = 1.0
+    lambda_ctx_stage1: float = 0.05
     stage1_positive_offset: int = 1
     stage1_positive_direction: str = "past"
     negative_injection_profile: str = "default"
-    stage1_relational_negative_p: float = 0.0
-    stage1_relational_max_shift_ratio: float = 0.15
-    stage1_relational_max_channels: int = 5
     stage2_relational_negative_p: float = 0.0
     stage2_relational_max_shift_ratio: float = 0.10
     stage2_relational_max_channels: int = 4
     relational_time_shift_weight: float = 0.45
     relational_channel_replace_weight: float = 0.40
     relational_channel_shuffle_weight: float = 0.15
-    stage1_log_real_anomaly_distance: bool = False
-    stage1_real_anomaly_min_fraction: float = 0.0
     enable_stage1_recon_scoring: bool = False
     enable_stage_visualization: bool = False
     visualization_max_points: int = 3000
@@ -177,6 +163,10 @@ _COMMON_EXPLICIT: Dict[str, object] = {
     "v2_first_kernel_size": 0,
     "tcn_dropout": 0.1,
     "tcn_activation": "relu",
+    "dual_history_len": 20,
+    "dual_current_out": 8,
+    "dual_short_out": 16,
+    "dual_long_out": 16,
     "epoch_stage0": 10,
     "epoch_stage1": 10,
     "epoch_stage2": 20,
@@ -230,21 +220,10 @@ _COMMON_EXPLICIT: Dict[str, object] = {
     "pin_memory": True,
     "enable_tf32": True,
     "cudnn_benchmark": True,
-    "stage1_log_real_anomaly_distance": True,
-    "stage1_real_anomaly_min_fraction": 0.0,
-    "stage1_use_masked_reconstruction": False,
-    "stage1_mask_ratio_time": 0.15,
-    "stage1_mask_num_channels": 0,
-    "stage1_recon_loss_on_mask_only": True,
-    "stage1_use_injected_triplet": False,
-    "stage1_triplet_margin": 1.0,
-    "lambda_stage1_triplet": 1.0,
+    "lambda_ctx_stage1": 0.05,
     "stage1_positive_offset": 1,
     "stage1_positive_direction": "past",
     "negative_injection_profile": "default",
-    "stage1_relational_negative_p": 0.0,
-    "stage1_relational_max_shift_ratio": 0.15,
-    "stage1_relational_max_channels": 5,
     "stage2_relational_negative_p": 0.0,
     "stage2_relational_max_shift_ratio": 0.10,
     "stage2_relational_max_channels": 4,
@@ -267,6 +246,9 @@ _DATASET_PRESETS: Dict[str, Dict[str, object]] = {
         "in_channels": 8,
         "tcn_layers": (64, 128, 128),
         "latent_dim": 64,
+        "dual_current_out": 4,
+        "dual_short_out": 8,
+        "dual_long_out": 8,
         "use_attentive_pooling": True,
         "epoch_stage0": 10,
         "epoch_stage1": 10,
@@ -283,7 +265,10 @@ _DATASET_PRESETS: Dict[str, Dict[str, object]] = {
         "step": 1,
         "in_channels": 25,
         "tcn_layers": (64, 128, 256, 256, 256),
-        "latent_dim": 64,
+        "latent_dim": 96,
+        "dual_current_out": 8,
+        "dual_short_out": 24,
+        "dual_long_out": 24,
         "use_attentive_pooling": True,
         "epoch_stage0": 10,
         "epoch_stage1": 10,
@@ -301,6 +286,9 @@ _DATASET_PRESETS: Dict[str, Dict[str, object]] = {
         "in_channels": 9,
         "tcn_layers": (64, 128, 128),
         "latent_dim": 64,
+        "dual_current_out": 4,
+        "dual_short_out": 8,
+        "dual_long_out": 8,
         "use_attentive_pooling": True,
         "epoch_stage0": 10,
         "epoch_stage1": 10,
@@ -317,7 +305,10 @@ _DATASET_PRESETS: Dict[str, Dict[str, object]] = {
         "step": 1,
         "in_channels": 18,
         "tcn_layers": (64, 128, 128),
-        "latent_dim": 64,
+        "latent_dim": 96,
+        "dual_current_out": 8,
+        "dual_short_out": 16,
+        "dual_long_out": 16,
         "use_attentive_pooling": True,
         "epoch_stage0": 10,
         "epoch_stage1": 10,
@@ -334,7 +325,10 @@ _DATASET_PRESETS: Dict[str, Dict[str, object]] = {
         "step": 1,
         "in_channels": 51,
         "tcn_layers": (64, 128, 128),
-        "latent_dim": 64,
+        "latent_dim": 192,
+        "dual_current_out": 16,
+        "dual_short_out": 32,
+        "dual_long_out": 32,
         "use_attentive_pooling": True,
         "epoch_stage0": 10,
         "epoch_stage1": 10,
@@ -351,7 +345,10 @@ _DATASET_PRESETS: Dict[str, Dict[str, object]] = {
         "step": 1,
         "in_channels": 25,
         "tcn_layers": (64, 128, 128),
-        "latent_dim": 64,
+        "latent_dim": 96,
+        "dual_current_out": 8,
+        "dual_short_out": 24,
+        "dual_long_out": 24,
         "use_attentive_pooling": True,
         "epoch_stage0": 10,
         "epoch_stage1": 10,
@@ -368,7 +365,10 @@ _DATASET_PRESETS: Dict[str, Dict[str, object]] = {
         "step": 1,
         "in_channels": 38,
         "tcn_layers": (64, 128, 256),
-        "latent_dim": 64,
+        "latent_dim": 160,
+        "dual_current_out": 16,
+        "dual_short_out": 24,
+        "dual_long_out": 24,
         "use_attentive_pooling": True,
         "epoch_stage0": 10,
         "epoch_stage1": 10,
@@ -462,6 +462,14 @@ def apply_stage2_method_defaults(
     return merged
 
 
+def apply_model_defaults(values: Dict[str, object]) -> Dict[str, object]:
+    """Resolve model fields that intentionally follow other model fields."""
+    merged = dict(values)
+    if int(merged.get("state_dim", 0) or 0) <= 0:
+        merged["state_dim"] = int(merged.get("latent_dim", 0) or 0)
+    return merged
+
+
 def available_datasets() -> Tuple[str, ...]:
     return tuple(_DATASET_PRESETS.keys())
 
@@ -481,6 +489,7 @@ def build_dataset_config(dataset: str, overrides: Optional[Dict[str, object]] = 
     if overrides:
         merged.update(dict(overrides))
     merged = apply_stage2_method_defaults(merged, explicit_overrides=overrides)
+    merged = apply_model_defaults(merged)
     return Config.from_dict(merged)
 
 

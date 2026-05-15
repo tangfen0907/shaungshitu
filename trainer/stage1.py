@@ -1,6 +1,5 @@
-from typing import List, Tuple
+from typing import Tuple
 
-import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -12,9 +11,9 @@ __all__ = [
     '_prepare_stage1_pair_batch',
     '_relational_mode_weights',
     '_use_relational_batch_negative',
-    '_inject_stage1_negative_batch',
-    '_extract_label_window',
-    '_build_stage1_real_anomaly_index_pool',
+    '_stage1_context_shift',
+    '_stage1_aligned_point_tokens',
+    '_stage1_context_consistency_loss',
     '_normal_only_warmup_epoch',
     '_build_stage1_loader',
     'run_stage1_epoch',
@@ -23,7 +22,7 @@ __all__ = [
 
 def _prepare_stage1_pair_batch(self, batch) -> Tuple[torch.Tensor, torch.Tensor]:
     if not isinstance(batch, (tuple, list)) or len(batch) != 2:
-        raise ValueError("Stage 1 triplet warmup expects batches shaped as (anchor, positive).")
+        raise ValueError("Stage 1 expects batches shaped as (anchor, positive).")
     anchor, positive = batch
     return (
         anchor.float().to(self.device, non_blocking=self._pin_memory()),
@@ -32,6 +31,7 @@ def _prepare_stage1_pair_batch(self, batch) -> Tuple[torch.Tensor, torch.Tensor]
 
 
 def _relational_mode_weights(self):
+    # Kept for Stage2 relational negative generation.
     return (
         float(getattr(self.config, "relational_time_shift_weight", 0.45)),
         float(getattr(self.config, "relational_channel_replace_weight", 0.40)),
@@ -40,87 +40,115 @@ def _relational_mode_weights(self):
 
 
 def _use_relational_batch_negative(self, stage: str) -> bool:
-    stage_key = str(stage or "stage1").strip().lower()
+    # Stage1 no longer uses injected negatives. This helper remains only
+    # because Stage2 still supports relational negative generation.
+    stage_key = str(stage or "").strip().lower()
+    if stage_key != "stage2":
+        return False
     profile = str(getattr(self.config, "negative_injection_profile", "default")).strip().lower()
     if profile not in {"relational", "relational_smap", "smap_relational"}:
         return False
-    p_name = "stage2_relational_negative_p" if stage_key == "stage2" else "stage1_relational_negative_p"
-    return float(getattr(self.config, p_name, 0.0)) > 0.0
+    return float(getattr(self.config, "stage2_relational_negative_p", 0.0)) > 0.0
+
+def _stage1_context_shift(self) -> int:
+    positive_offset = max(1, int(getattr(self.config, "stage1_positive_offset", 1)))
+    dataset_step = max(
+        1,
+        int(
+            getattr(
+                getattr(self, "full_train_dataset", self.train_loader.dataset),
+                "step",
+                getattr(self.config, "train_step", getattr(self.config, "step", 1)),
+            )
+        ),
+    )
+    return positive_offset * dataset_step
 
 
-def _inject_stage1_negative_batch(self, x: torch.Tensor, stage: str = "stage1") -> torch.Tensor:
-    stage_key = str(stage or "stage1").strip().lower()
-    if self._use_relational_batch_negative(stage_key):
-        prefix = "stage2" if stage_key == "stage2" else "stage1"
-        return self.injector.inject_relational_batch(
-            x.detach(),
-            p=float(getattr(self.config, f"{prefix}_relational_negative_p", 1.0)),
-            max_shift_ratio=float(getattr(self.config, f"{prefix}_relational_max_shift_ratio", 0.15)),
-            max_channels=int(getattr(self.config, f"{prefix}_relational_max_channels", 0)),
-            mode_weights=self._relational_mode_weights(),
-            return_mask=False,
-        ).to(device=x.device, dtype=x.dtype)
+def _stage1_aligned_point_tokens(
+    self,
+    anchor_tokens: torch.Tensor,
+    positive_tokens: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if anchor_tokens.dim() != 3 or positive_tokens.dim() != 3:
+        raise ValueError(
+            "Stage1 point-token alignment expects [B, T, D] tensors, "
+            f"got {tuple(anchor_tokens.shape)} and {tuple(positive_tokens.shape)}."
+        )
+    if tuple(anchor_tokens.shape) != tuple(positive_tokens.shape):
+        raise ValueError(
+            "Stage1 anchor/positive point-token tensors should have the same shape, "
+            f"got {tuple(anchor_tokens.shape)} vs {tuple(positive_tokens.shape)}."
+        )
 
-    negatives = [self.injector(sample) for sample in x.detach()]
-    return torch.stack(negatives, dim=0).to(device=x.device, dtype=x.dtype)
+    shift = self._stage1_context_shift()
+    length = int(anchor_tokens.size(1))
+    if shift >= length:
+        raise ValueError(
+            "Stage1 context shift should be smaller than the window length: "
+            f"shift={shift}, length={length}."
+        )
+
+    direction = str(getattr(self.config, "stage1_positive_direction", "past")).strip().lower()
+    if direction in {"past", "previous", "prev", "behind"}:
+        return anchor_tokens[:, :-shift, :], positive_tokens[:, shift:, :]
+    if direction in {"future", "next"}:
+        return anchor_tokens[:, shift:, :], positive_tokens[:, :-shift, :]
+    raise ValueError(
+        "stage1_positive_direction should be one of: past, previous, prev, behind, future, next."
+    )
 
 
-@staticmethod
-def _extract_label_window(sample):
-    if isinstance(sample, (tuple, list)) and len(sample) >= 2:
-        return sample[1]
-    return None
+def _stage1_context_consistency_loss(
+    self,
+    outputs_anchor,
+    outputs_positive,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    reference = outputs_anchor.get("z")
+    if reference is None:
+        raise RuntimeError("Stage1 outputs should contain z for dtype/device reference.")
+    zero = torch.zeros((), device=reference.device, dtype=reference.dtype)
+    if not all(key in outputs_anchor and key in outputs_positive for key in ("H1", "H2")):
+        return zero, zero, zero
 
-
-def _build_stage1_real_anomaly_index_pool(self) -> List[int]:
-    if not getattr(self.config, "stage1_log_real_anomaly_distance", False):
-        return []
-
-    dataset = self.test_loader.dataset
-    min_fraction = max(0.0, float(getattr(self.config, "stage1_real_anomaly_min_fraction", 0.0)))
-    anomaly_indices: List[int] = []
-
-    for idx in range(len(dataset)):
-        labels = self._extract_label_window(dataset[idx])
-        if labels is None:
-            continue
-
-        label_array = np.asarray(labels, dtype=np.float32).reshape(-1)
-        if label_array.size == 0:
-            continue
-
-        anomaly_fraction = float((label_array > 0).mean())
-        if anomaly_fraction > 0.0 and anomaly_fraction >= min_fraction:
-            anomaly_indices.append(idx)
-
-    return anomaly_indices
+    anchor_v1, positive_v1 = self._stage1_aligned_point_tokens(
+        outputs_anchor["H1"],
+        outputs_positive["H1"],
+    )
+    anchor_v2, positive_v2 = self._stage1_aligned_point_tokens(
+        outputs_anchor["H2"],
+        outputs_positive["H2"],
+    )
+    loss_ctx_v1 = torch.mean((anchor_v1 - positive_v1) ** 2)
+    loss_ctx_v2 = torch.mean((anchor_v2 - positive_v2) ** 2)
+    return 0.5 * (loss_ctx_v1 + loss_ctx_v2), loss_ctx_v1, loss_ctx_v2
 
 
 def _normal_only_warmup_epoch(self, loader: DataLoader, epoch: int, total_epoch: int, stage_name: str):
     """
-    Stage 1 latent warmup.
+    Stage 1 point-level context warmup.
 
-    This stage uses the unlabeled training split only. When the injected
-    triplet option is enabled, labels are still ignored: the negative is a
-    synthetic anomaly generated from the anchor window.
+    This stage uses adjacent anchor-positive windows only:
+        1. reconstruct the full anchor window;
+        2. align the same real time points across neighboring windows and keep
+           their point-level representations close.
     """
     self.model.train()
     total_loss = 0.0
     total_rec = 0.0
-    total_triplet = 0.0
-    total_cv = 0.0
+    total_ctx = 0.0
     total_rec_v1 = 0.0
     total_rec_v2 = 0.0
-    total_triplet_v1 = 0.0
-    total_triplet_v2 = 0.0
+    total_ctx_v1 = 0.0
+    total_ctx_v2 = 0.0
     total_z1_norm = 0.0
     total_z2_norm = 0.0
     total_z1_std = 0.0
     total_z2_std = 0.0
     total_z_norm = 0.0
     total_z_std = 0.0
-    use_masked = bool(getattr(self.config, "stage1_use_masked_reconstruction", False))
-    use_triplet = bool(getattr(self.config, "stage1_use_injected_triplet", False))
+    lambda_rec = float(getattr(self.config, "lambda_rec", 1.0))
+    lambda_ctx = float(getattr(self.config, "lambda_ctx_stage1", 0.05))
 
     progress = tqdm(
         loader,
@@ -129,50 +157,18 @@ def _normal_only_warmup_epoch(self, loader: DataLoader, epoch: int, total_epoch:
         disable=not self._show_batch_progress(),
     )
     for batch in progress:
-        if use_triplet:
-            x, x_positive = self._prepare_stage1_pair_batch(batch)
-        else:
-            x = self._prepare_batch(batch)
-            x_positive = None
+        x_anchor, x_positive = self._prepare_stage1_pair_batch(batch)
 
-        if use_masked:
-            x_input, recon_mask = self._build_stage1_masked_input(x)
-        else:
-            x_input, recon_mask = x, None
-
-        outputs = self.model(x_input, stage="stage1")
-        z = outputs["z"]
-        rec_v1, rec_v2 = self._dual_reconstruction_losses_from_outputs(outputs, x, recon_mask)
+        outputs_anchor = self.model(x_anchor, stage="stage1")
+        outputs_positive = self.model(x_positive, stage="stage1")
+        z = outputs_anchor["z"]
+        rec_v1, rec_v2 = self._dual_reconstruction_losses_from_outputs(outputs_anchor, x_anchor)
         loss_rec = 0.5 * (rec_v1 + rec_v2) if self._is_dual_view_model() else rec_v1
-        loss_cv = self._cross_view_consistency_loss(outputs, x)
-        loss_triplet = torch.zeros((), device=self.device, dtype=loss_rec.dtype)
-        triplet_v1 = torch.zeros((), device=self.device, dtype=loss_rec.dtype)
-        triplet_v2 = torch.zeros((), device=self.device, dtype=loss_rec.dtype)
-        if use_triplet and x_positive is not None:
-            x_negative = self._inject_stage1_negative_batch(x)
-            if self._is_dual_view_model():
-                if use_masked:
-                    z_anchor1, z_anchor2 = self.model.encode_views(x)
-                else:
-                    z_anchor1, z_anchor2 = outputs["z1"], outputs["z2"]
-                z_positive1, z_positive2 = self.model.encode_views(x_positive)
-                z_negative1, z_negative2 = self.model.encode_views(x_negative)
-                triplet_v1 = self._stage1_triplet_embedding_loss(z_anchor1, z_positive1, z_negative1)
-                triplet_v2 = self._stage1_triplet_embedding_loss(z_anchor2, z_positive2, z_negative2)
-                loss_triplet = 0.5 * (triplet_v1 + triplet_v2)
-            else:
-                z_anchor = self.model.encode(x) if use_masked else z
-                z_positive = self.model.encode(x_positive)
-                z_negative = self.model.encode(x_negative)
-                loss_triplet = self._stage1_triplet_embedding_loss(z_anchor, z_positive, z_negative)
-                triplet_v1 = loss_triplet
-                triplet_v2 = loss_triplet
-
-        loss = (
-            float(getattr(self.config, "lambda_rec", 1.0)) * loss_rec
-            + float(getattr(self.config, "lambda_stage1_triplet", 1.0)) * loss_triplet
-            + float(getattr(self.config, "lambda_cv_stage1", 0.0)) * loss_cv
+        loss_ctx, ctx_v1, ctx_v2 = self._stage1_context_consistency_loss(
+            outputs_anchor,
+            outputs_positive,
         )
+        loss = lambda_rec * loss_rec + lambda_ctx * loss_ctx
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -180,27 +176,25 @@ def _normal_only_warmup_epoch(self, loader: DataLoader, epoch: int, total_epoch:
 
         total_loss += loss.item()
         total_rec += loss_rec.item()
-        total_triplet += loss_triplet.item()
-        total_cv += loss_cv.item()
+        total_ctx += loss_ctx.item()
         total_rec_v1 += rec_v1.item()
         total_rec_v2 += rec_v2.item()
-        total_triplet_v1 += triplet_v1.item()
-        total_triplet_v2 += triplet_v2.item()
+        total_ctx_v1 += ctx_v1.item()
+        total_ctx_v2 += ctx_v2.item()
         total_z_norm += torch.norm(z, dim=1).mean().item()
         total_z_std += z.std(dim=0, unbiased=False).mean().item()
         if self._is_dual_view_model():
-            total_z1_norm += torch.norm(outputs["z1"], dim=1).mean().item()
-            total_z2_norm += torch.norm(outputs["z2"], dim=1).mean().item()
-            total_z1_std += outputs["z1"].std(dim=0, unbiased=False).mean().item()
-            total_z2_std += outputs["z2"].std(dim=0, unbiased=False).mean().item()
+            total_z1_norm += torch.norm(outputs_anchor["z1"], dim=1).mean().item()
+            total_z2_norm += torch.norm(outputs_anchor["z2"], dim=1).mean().item()
+            total_z1_std += outputs_anchor["z1"].std(dim=0, unbiased=False).mean().item()
+            total_z2_std += outputs_anchor["z2"].std(dim=0, unbiased=False).mean().item()
         progress.set_postfix(
             {
                 "loss": f"{loss.item():.4f}",
                 "r1": f"{rec_v1.item():.4f}",
                 "r2": f"{rec_v2.item():.4f}",
-                "t1": f"{triplet_v1.item():.4f}",
-                "t2": f"{triplet_v2.item():.4f}",
-                "cv": f"{loss_cv.item():.4f}",
+                "c1": f"{ctx_v1.item():.4f}",
+                "c2": f"{ctx_v2.item():.4f}",
             }
         )
 
@@ -208,6 +202,7 @@ def _normal_only_warmup_epoch(self, loader: DataLoader, epoch: int, total_epoch:
     logs = {
         "loss": total_loss / denom,
         "loss_rec": total_rec / denom,
+        "loss_ctx": total_ctx / denom,
         "z_norm": total_z_norm / denom,
         "z_std": total_z_std / denom,
     }
@@ -216,34 +211,26 @@ def _normal_only_warmup_epoch(self, loader: DataLoader, epoch: int, total_epoch:
             {
                 "rec_v1": total_rec_v1 / denom,
                 "rec_v2": total_rec_v2 / denom,
+                "ctx_v1": total_ctx_v1 / denom,
+                "ctx_v2": total_ctx_v2 / denom,
                 "z1_norm": total_z1_norm / denom,
                 "z2_norm": total_z2_norm / denom,
                 "z1_std": total_z1_std / denom,
                 "z2_std": total_z2_std / denom,
             }
         )
-    if use_triplet:
-        logs["loss_triplet"] = total_triplet / denom
-        if self._is_dual_view_model():
-            logs["triplet_v1"] = total_triplet_v1 / denom
-            logs["triplet_v2"] = total_triplet_v2 / denom
-    if float(getattr(self.config, "lambda_cv_stage1", 0.0)) != 0.0:
-        logs["loss_cv"] = total_cv / denom
     self._log_epoch(stage_name, epoch, total_epoch, logs)
 
 
 def _build_stage1_loader(self) -> DataLoader:
-    if bool(getattr(self.config, "stage1_use_injected_triplet", False)):
-        stage1_dataset = Stage1AdjacentPairDataset(
-            base_dataset=getattr(self, "full_train_dataset", self.train_loader.dataset),
-            positive_offset=int(getattr(self.config, "stage1_positive_offset", 1)),
-            positive_direction=str(getattr(self.config, "stage1_positive_direction", "past")),
-            active_mask=self._current_active_train_mask()
-            if hasattr(self, "_current_active_train_mask")
-            else None,
-        )
-    else:
-        stage1_dataset = self.train_loader.dataset
+    stage1_dataset = Stage1AdjacentPairDataset(
+        base_dataset=getattr(self, "full_train_dataset", self.train_loader.dataset),
+        positive_offset=int(getattr(self.config, "stage1_positive_offset", 1)),
+        positive_direction=str(getattr(self.config, "stage1_positive_direction", "past")),
+        active_mask=self._current_active_train_mask()
+        if hasattr(self, "_current_active_train_mask")
+        else None,
+    )
     return DataLoader(
         dataset=stage1_dataset,
         batch_size=self.config.batch_size,

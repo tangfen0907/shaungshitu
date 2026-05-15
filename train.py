@@ -42,7 +42,6 @@ def build_common_preset_overrides(
         "active_view",
         "dual_view_feature_mode",
         "joint_core_mode",
-        "readout_mode",
         "scaler_fit_mode",
         "stage1_positive_direction",
         "stage2_method",
@@ -100,16 +99,14 @@ TRAIN_OVERRIDE_KEYS = [
     "tcn_dropout",
     "tcn_activation",
     "use_attentive_pooling",
-    "readout_mode",
     "topk_ratio",
     "topk_k",
-    "patch_len",
-    "patch_stride",
+    "dual_history_len",
+    "dual_current_out",
+    "dual_short_out",
+    "dual_long_out",
     "active_view",
     "dual_view_feature_mode",
-    "lambda_cv_stage0",
-    "lambda_cv_stage1",
-    "lambda_cv_stage2",
     "dual_score_weight_v1",
     "dual_score_weight_v2",
     "dual_score_weight_cv",
@@ -162,13 +159,7 @@ TRAIN_OVERRIDE_KEYS = [
     "pin_memory",
     "enable_tf32",
     "cudnn_benchmark",
-    "stage1_use_masked_reconstruction",
-    "stage1_mask_ratio_time",
-    "stage1_mask_num_channels",
-    "stage1_recon_loss_on_mask_only",
-    "stage1_use_injected_triplet",
-    "stage1_triplet_margin",
-    "lambda_stage1_triplet",
+    "lambda_ctx_stage1",
     "stage1_positive_offset",
     "stage1_positive_direction",
     "num_stage2_rounds",
@@ -216,16 +207,12 @@ def build_parser(
     parser.add_argument("--tcn_dropout", type=float, default=None)
     parser.add_argument("--tcn_activation", type=str, default=None)
     parser.add_argument("--use_attentive_pooling", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument(
-        "--readout_mode",
-        type=str,
-        default=None,
-        choices=["attn_topk_max", "attention", "attn", "last", "topk_max"],
-    )
     parser.add_argument("--topk_ratio", type=float, default=None)
     parser.add_argument("--topk_k", type=int, default=None)
-    parser.add_argument("--patch_len", type=int, default=None)
-    parser.add_argument("--patch_stride", type=int, default=None)
+    parser.add_argument("--dual_history_len", type=int, default=None)
+    parser.add_argument("--dual_current_out", type=int, default=None)
+    parser.add_argument("--dual_short_out", type=int, default=None)
+    parser.add_argument("--dual_long_out", type=int, default=None)
     parser.add_argument(
         "--active_view",
         type=str,
@@ -233,9 +220,6 @@ def build_parser(
         choices=["v1", "v2_flatten", "dual"],
     )
     parser.add_argument("--dual_view_feature_mode", type=str, default=None, choices=["avg", "v1", "v2"])
-    parser.add_argument("--lambda_cv_stage0", type=float, default=None)
-    parser.add_argument("--lambda_cv_stage1", type=float, default=None)
-    parser.add_argument("--lambda_cv_stage2", type=float, default=None)
     parser.add_argument("--dual_score_weight_v1", type=float, default=None)
     parser.add_argument("--dual_score_weight_v2", type=float, default=None)
     parser.add_argument("--dual_score_weight_cv", type=float, default=None)
@@ -294,13 +278,7 @@ def build_parser(
     parser.add_argument("--enable_tf32", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--cudnn_benchmark", action=argparse.BooleanOptionalAction, default=None)
 
-    parser.add_argument("--stage1_use_masked_reconstruction", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--stage1_mask_ratio_time", type=float, default=None)
-    parser.add_argument("--stage1_mask_num_channels", type=int, default=None)
-    parser.add_argument("--stage1_recon_loss_on_mask_only", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--stage1_use_injected_triplet", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--stage1_triplet_margin", type=float, default=None)
-    parser.add_argument("--lambda_stage1_triplet", type=float, default=None)
+    parser.add_argument("--lambda_ctx_stage1", type=float, default=None)
     parser.add_argument("--stage1_positive_offset", type=int, default=None)
     parser.add_argument("--stage1_positive_direction", type=str, default=None)
 

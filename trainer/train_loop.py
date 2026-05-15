@@ -29,32 +29,40 @@ def run_train_loop(solver):
     self._trim_active_training_pool("stage0")
 
     print("========== Stage A1: Unlabeled-train Latent Warmup ==========")
+    train_dataset_step = max(
+        1,
+        int(getattr(getattr(self, "full_train_dataset", self.train_loader.dataset), "step", 1)),
+    )
+    stage1_shift = int(getattr(self.config, "stage1_positive_offset", 1)) * train_dataset_step
     print(
         "[StageA1] setup | "
-        "reconstruction=enabled | "
-        f"masked_reconstruction={bool(getattr(self.config, 'stage1_use_masked_reconstruction', False))} | "
-        f"mask_ratio_time={float(getattr(self.config, 'stage1_mask_ratio_time', 0.0)):.3f} | "
-        f"mask_num_channels={int(getattr(self.config, 'stage1_mask_num_channels', 0))} | "
-        f"loss_on_mask_only={bool(getattr(self.config, 'stage1_recon_loss_on_mask_only', True))} | "
-        f"injected_triplet={bool(getattr(self.config, 'stage1_use_injected_triplet', False))} | "
+        "reconstruction=full_window_anchor | "
+        "context=neighbor_same_point | "
         f"positive_direction={str(getattr(self.config, 'stage1_positive_direction', 'past'))} | "
         f"positive_offset={int(getattr(self.config, 'stage1_positive_offset', 1))} | "
-        f"triplet_margin={float(getattr(self.config, 'stage1_triplet_margin', 1.0)):.3f} | "
-        f"lambda_triplet={float(getattr(self.config, 'lambda_stage1_triplet', 1.0)):.3f} | "
-        f"negative_profile={str(getattr(self.config, 'negative_injection_profile', 'default'))} | "
-        f"rel_stage1_p={float(getattr(self.config, 'stage1_relational_negative_p', 0.0)):.2f} | "
-        f"rel_stage2_p={float(getattr(self.config, 'stage2_relational_negative_p', 0.0)):.2f}"
+        f"raw_shift={stage1_shift} | "
+        f"lambda_ctx={float(getattr(self.config, 'lambda_ctx_stage1', 0.05)):.3f}"
     )
-    print(
-        "[Encoder] setup | "
-        f"AttentivePooling={bool(getattr(self.config, 'use_attentive_pooling', False))}"
-    )
-    if getattr(self.config, "stage1_log_real_anomaly_distance", False):
-        pool_size = len(self.stage1_real_anomaly_indices)
-        min_fraction = float(getattr(self.config, "stage1_real_anomaly_min_fraction", 0.0))
+    if self._is_dual_view_model():
+        channels = int(getattr(self.config, "in_channels", 0))
+        history_len = int(getattr(self.config, "dual_history_len", 20))
+        current_out = int(getattr(self.config, "dual_current_out", 8))
+        short_out = int(getattr(self.config, "dual_short_out", 16))
+        long_out = int(getattr(self.config, "dual_long_out", 16))
         print(
-            "[StageA1] Real anomaly monitor pool: "
-            f"{pool_size} windows | min_anomaly_fraction={min_fraction:.3f}"
+            "[Encoder] setup | "
+            "pointwise_dual | "
+            f"L={history_len} | "
+            f"F1_dim={3 * channels + history_len} | "
+            f"F2_dim={current_out + short_out + long_out} "
+            f"({current_out}+{short_out}+{long_out}) | "
+            f"d_model={int(getattr(self.config, 'latent_dim', 0))} | "
+            "reconstruction=full_window"
+        )
+    else:
+        print(
+            "[Encoder] setup | "
+            f"AttentivePooling={bool(getattr(self.config, 'use_attentive_pooling', False))}"
         )
     stage1_loader = self._build_stage1_loader()
     for epoch in range(1, self.config.epoch_stage1 + 1):
