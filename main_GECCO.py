@@ -28,7 +28,7 @@ LOCAL_CONFIG_OVERRIDES = {
     'epoch_stage0': 10,
     'epoch_stage1': 10,
     'epoch_stage2': 6,
-    'num_stage2_rounds': 3,
+    'num_stage2_rounds': 10,
     'stage2_a_epochs': 1,
     'stage2_b_epochs': 1,
     'batch_size': 256,

@@ -11,14 +11,14 @@ from metrics.vus.metrics import get_range_vus_roc
 import numpy as np
 
 def combine_all_evaluation_scores(y_test, pred_labels, anomaly_scores):
-    events_pred = convert_vector_to_events(y_test) 
-    events_gt = convert_vector_to_events(pred_labels)
+    events_pred = convert_vector_to_events(pred_labels)
+    events_gt = convert_vector_to_events(y_test)
     Trange = (0, len(y_test))
     affiliation = pr_from_events(events_pred, events_gt, Trange)
     true_events = get_events(y_test)
-    pa_accuracy, pa_precision, pa_recall, pa_f_score = get_adjust_F1PA(y_test, pred_labels)
+    pa_accuracy, pa_precision, pa_recall, pa_f_score = get_adjust_F1PA(pred_labels.copy(), y_test.copy())
     MCC_score = MCC(y_test, pred_labels)
-    vus_results = get_range_vus_roc(y_test, pred_labels, 100) # default slidingWindow = 100
+    vus_results = get_range_vus_roc(anomaly_scores, y_test, 100) # default slidingWindow = 100
     
     score_list_simple = {
                   "pa_accuracy":pa_accuracy, 

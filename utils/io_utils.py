@@ -9,13 +9,19 @@ from utils.config import Config
 def save_result_artifacts(run_dir: str, results: dict):
     metrics_path = os.path.join(run_dir, "test_metrics.json")
     summary = {
-        "metrics": results["metrics"],
-        "threshold": results["threshold"],
+        "metrics": results.get("metrics", {}),
+        "threshold": results.get("threshold"),
         "score_name": results.get("score_name", ""),
     }
     score_families = {}
     for key in ["center_distance", "reconstruction", "cross_view"]:
         family = results.get(key, {})
+        if family:
+            score_families[key] = {
+                "metrics": family.get("metrics", {}),
+                "threshold": family.get("threshold"),
+            }
+    for key, family in results.get("component_families", {}).items():
         if family:
             score_families[key] = {
                 "metrics": family.get("metrics", {}),
@@ -27,11 +33,13 @@ def save_result_artifacts(run_dir: str, results: dict):
         json.dump(summary, file, ensure_ascii=False, indent=2)
 
     npy_payloads = {
-        "scores.npy": results["scores"],
-        "pred_labels.npy": results["pred_labels"],
-        "y_true.npy": results["y_true"],
+        "y_true.npy": results.get("y_true"),
         "test_latent_features.npy": results.get("test_features"),
     }
+    if results.get("scores") is not None:
+        npy_payloads["scores.npy"] = results.get("scores")
+    if results.get("pred_labels") is not None:
+        npy_payloads["pred_labels.npy"] = results.get("pred_labels")
     for key in ["center_distance", "reconstruction", "cross_view"]:
         family = results.get(key, {})
         if not family:

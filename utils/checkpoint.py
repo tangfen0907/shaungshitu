@@ -6,7 +6,12 @@ import numpy as np
 import torch
 
 
-__all__ = ['_export_bank_artifacts', '_save_checkpoint', 'load_checkpoint']
+__all__ = [
+    '_export_bank_artifacts',
+    '_save_checkpoint',
+    '_save_stage_checkpoint',
+    'load_checkpoint',
+]
 
 
 def _export_bank_artifacts(self) -> Dict[str, object]:
@@ -36,8 +41,7 @@ def _export_bank_artifacts(self) -> Dict[str, object]:
     return artifacts
 
 
-def _save_checkpoint(self):
-    checkpoint_path = os.path.join(self.config.save_dir, self.config.checkpoint_name)
+def _checkpoint_payload(self, stage_label: str = None) -> Dict[str, object]:
     payload = {
         "model_state_dict": self.model.state_dict(),
         "config": self.config.to_dict(),
@@ -55,8 +59,38 @@ def _save_checkpoint(self):
         "active_pool_history": getattr(self, "active_pool_history", []),
         "joint_core_label_diagnostics": getattr(self, "joint_core_label_diagnostics", []),
     }
+    if stage_label is not None:
+        payload["stage_label"] = str(stage_label)
+    return payload
+
+
+def _save_checkpoint_file(self, checkpoint_name: str, message: str, stage_label: str = None):
+    checkpoint_path = os.path.join(self.config.save_dir, checkpoint_name)
+    payload = _checkpoint_payload(self, stage_label=stage_label)
     torch.save(payload, checkpoint_path)
-    print(f"Final model checkpoint saved to: {checkpoint_path}")
+    print(f"{message}: {checkpoint_path}")
+
+
+def _save_stage_checkpoint(self, stage_name: str):
+    stage_name = str(stage_name).strip().lower()
+    if not stage_name:
+        raise ValueError("stage_name must be a non-empty string.")
+    checkpoint_name = f"model_{stage_name}.pt"
+    _save_checkpoint_file(
+        self,
+        checkpoint_name=checkpoint_name,
+        message=f"[{stage_name.upper()}] model checkpoint saved to",
+        stage_label=stage_name,
+    )
+
+
+def _save_checkpoint(self):
+    _save_checkpoint_file(
+        self,
+        checkpoint_name=self.config.checkpoint_name,
+        message="Final model checkpoint saved to",
+        stage_label="final",
+    )
 
 
 def load_checkpoint(self, checkpoint_path: str):

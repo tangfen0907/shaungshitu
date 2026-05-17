@@ -11,7 +11,10 @@ from metrics.Matthews_correlation_coefficient import MCC
 from metrics.affiliation.generics import convert_vector_to_events
 from metrics.affiliation.metrics import pr_from_events
 from metrics.f1_score_f1_pa import get_adjust_F1PA
-from utils.scoring import compute_separate_proto_anomaly_score
+from utils.scoring import (
+    compute_separate_proto_component_scores,
+    previous_indices_from_point_indices,
+)
 
 try:
     from metrics.vus.metrics import get_range_vus_roc
@@ -21,7 +24,7 @@ except Exception:
     _VUS_AVAILABLE = False
 
 
-__all__ = ['_extract_label_window', '_build_window_anomaly_flags', '_build_window_anomaly_counts', '_build_point_anomaly_labels', '_build_point_anomaly_counts', '_dataset_point_window_indices', '_nearest_center_scores', '_threshold_scores', '_pairwise_distance_block', '_init_distance_stats', '_update_distance_stats', '_summarize_distance_stats', '_within_class_distance_stats', '_cross_class_distance_stats', '_sample_within_class_distances', '_sample_cross_class_distances', '_select_distance_analysis_subset', '_analyze_test_latent_distances', '_collect_reconstruction_scores', '_collect_dual_reconstruction_scores', '_cross_view_disagreement_from_evidence', '_save_stage1_reconstruction_scoring', '_format_index_count_preview', '_evaluate_score_family', '_normalize_score_pair', '_collect_cross_view_scores', '_collect_pointwise_separate_proto_eval_outputs', '_collect_separate_proto_eval_outputs', '_test_dual_separate_proto', 'run_evaluation']
+__all__ = ['_extract_label_window', '_build_window_anomaly_flags', '_build_window_anomaly_counts', '_build_point_anomaly_labels', '_build_point_anomaly_counts', '_dataset_point_window_indices', '_build_current_point_indices', '_build_current_point_anomaly_labels', '_nearest_center_scores', '_threshold_scores', '_pairwise_distance_block', '_init_distance_stats', '_update_distance_stats', '_summarize_distance_stats', '_within_class_distance_stats', '_cross_class_distance_stats', '_sample_within_class_distances', '_sample_cross_class_distances', '_select_distance_analysis_subset', '_analyze_test_latent_distances', '_collect_reconstruction_scores', '_collect_dual_reconstruction_scores', '_cross_view_disagreement_from_evidence', '_save_stage1_reconstruction_scoring', '_format_index_count_preview', '_evaluate_score_family', '_normalize_score_pair', '_collect_cross_view_scores', '_collect_pointwise_separate_proto_eval_outputs', '_collect_separate_proto_eval_outputs', '_test_dual_separate_proto', 'run_evaluation']
 
 
 def combine_all_evaluation_scores(y_test, pred_labels, anomaly_scores):
@@ -139,6 +142,43 @@ def _dataset_point_window_indices(dataset) -> np.ndarray:
     if hasattr(dataset, "indices"):
         return np.asarray(getattr(dataset, "indices"), dtype=np.int64).reshape(-1)
     return np.arange(len(dataset), dtype=np.int64)
+
+
+def _build_current_point_indices(self, dataset) -> np.ndarray:
+    window_indices = self._dataset_point_window_indices(dataset)
+
+    def _chain_attr(name: str, default=None):
+        current = dataset
+        seen = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if hasattr(current, name):
+                value = getattr(current, name)
+                if value is not None:
+                    return value
+            current = getattr(current, "base_dataset", getattr(current, "dataset", None))
+        return default
+
+    step = int(_chain_attr("step", 1))
+    win_size = int(_chain_attr("win_size", getattr(self.config, "seq_len", 1)))
+    current_point_offset = int(_chain_attr("current_point_offset", max(0, win_size - 1)))
+    return window_indices.astype(np.int64) * step + current_point_offset
+
+
+def _build_current_point_anomaly_labels(self, dataset) -> np.ndarray:
+    point_indices = self._build_current_point_indices(dataset)
+    point_label_source = self._build_point_anomaly_labels(dataset)
+    labels = np.zeros(len(dataset), dtype=np.int64)
+    for idx in range(len(dataset)):
+        label_window = self._extract_label_window(dataset[idx])
+        if label_window is not None:
+            label_array = np.asarray(label_window, dtype=np.float32).reshape(-1)
+            if label_array.size > 0:
+                labels[idx] = int(label_array[-1] > 0)
+                continue
+        safe_idx = int(np.clip(point_indices[idx], 0, max(0, point_label_source.shape[0] - 1)))
+        labels[idx] = int(point_label_source[safe_idx] > 0)
+    return labels
 
 
 @staticmethod
@@ -499,8 +539,9 @@ def _save_stage1_reconstruction_scoring(self) -> Dict[str, object]:
     test_score = self._collect_reconstruction_scores(self.test_loader)
     threshold = float(np.quantile(train_score, self.config.decision_quantile))
     pred_labels = (test_score > threshold).astype(np.int64)
-    y_true = self._build_window_anomaly_flags(self.test_loader.dataset)
-    y_count = self._build_window_anomaly_counts(self.test_loader.dataset)
+    y_true = self._build_current_point_anomaly_labels(self.test_loader.dataset)
+    y_count = y_true.astype(np.int64)
+    point_indices = self._build_current_point_indices(self.test_loader.dataset)
     metrics = combine_all_evaluation_scores(y_true.copy(), pred_labels.copy(), test_score.copy())
     metrics = {str(key): float(value) for key, value in metrics.items()}
 
@@ -516,8 +557,8 @@ def _save_stage1_reconstruction_scoring(self) -> Dict[str, object]:
         f"pred_anomaly={int(pred_anomaly_idx.size)}"
     )
     print(
-        "[Stage1][ReconScore] Pred anomaly window indices with anomaly-count: "
-        f"{self._format_index_count_preview(pred_anomaly_idx, pred_anomaly_counts)}"
+        "[Stage1][ReconScore] Pred anomaly point indices with labels: "
+        f"{self._format_index_count_preview(point_indices[pred_anomaly_idx], pred_anomaly_counts)}"
     )
     for key, value in metrics.items():
         print(f"[Stage1][ReconScore] {key}: {value:.6f}")
@@ -533,6 +574,7 @@ def _save_stage1_reconstruction_scoring(self) -> Dict[str, object]:
         "test_score_std": float(np.std(test_score)),
         "pred_anomaly_count": int(pred_anomaly_idx.size),
         "test_window_count": int(test_score.shape[0]),
+        "test_point_count": int(test_score.shape[0]),
     }
     os.makedirs(self.config.save_dir, exist_ok=True)
     with open(os.path.join(self.config.save_dir, "stage1_recon_metrics.json"), "w", encoding="utf-8") as file:
@@ -543,6 +585,7 @@ def _save_stage1_reconstruction_scoring(self) -> Dict[str, object]:
         "stage1_recon_test_scores.npy": test_score,
         "stage1_recon_pred_labels.npy": pred_labels,
         "stage1_recon_y_true.npy": y_true,
+        "stage1_recon_point_indices.npy": point_indices,
     }
     for filename, value in arrays.items():
         with open(os.path.join(self.config.save_dir, filename), "wb") as file:
@@ -680,6 +723,8 @@ def _collect_pointwise_separate_proto_eval_outputs(self, loader: DataLoader) -> 
         "u_joint": [],
         "q1": [],
         "q2": [],
+        "proto_dist_matrix1": [],
+        "proto_dist_matrix2": [],
         "proto_dist1": [],
         "proto_dist2": [],
         "pred1": [],
@@ -728,6 +773,8 @@ def _collect_pointwise_separate_proto_eval_outputs(self, loader: DataLoader) -> 
             collected["u_joint"].append(u_joint.detach().cpu().numpy())
             collected["q1"].append(outputs["q1"].detach().cpu().numpy())
             collected["q2"].append(outputs["q2"].detach().cpu().numpy())
+            collected["proto_dist_matrix1"].append(outputs["proto_dist_matrix1"].detach().cpu().numpy())
+            collected["proto_dist_matrix2"].append(outputs["proto_dist_matrix2"].detach().cpu().numpy())
             collected["proto_dist1"].append(outputs["proto_dist1"].detach().cpu().numpy())
             collected["proto_dist2"].append(outputs["proto_dist2"].detach().cpu().numpy())
             collected["pred1"].append(outputs["proto_pred1"].detach().cpu().numpy())
@@ -761,6 +808,8 @@ def _collect_separate_proto_eval_outputs(self, loader: DataLoader) -> Dict[str, 
         "u_joint": [],
         "q1": [],
         "q2": [],
+        "proto_dist_matrix1": [],
+        "proto_dist_matrix2": [],
         "proto_dist1": [],
         "proto_dist2": [],
         "pred1": [],
@@ -779,6 +828,8 @@ def _collect_separate_proto_eval_outputs(self, loader: DataLoader) -> Dict[str, 
                 u2 = outputs["u2"]
                 q1 = outputs["q1"]
                 q2 = outputs["q2"]
+                proto_dist_matrix1 = outputs["proto_dist_matrix1"]
+                proto_dist_matrix2 = outputs["proto_dist_matrix2"]
                 proto_dist1 = outputs["proto_dist1"]
                 proto_dist2 = outputs["proto_dist2"]
                 pred1 = outputs["proto_pred1"]
@@ -796,6 +847,8 @@ def _collect_separate_proto_eval_outputs(self, loader: DataLoader) -> Dict[str, 
                 u2 = outputs["u"]
                 q1 = outputs["q"]
                 q2 = outputs["q"]
+                proto_dist_matrix1 = outputs["proto_dist_matrix"]
+                proto_dist_matrix2 = outputs["proto_dist_matrix"]
                 proto_dist1 = outputs["proto_dist"]
                 proto_dist2 = outputs["proto_dist"]
                 pred1 = outputs["proto_pred"]
@@ -811,6 +864,8 @@ def _collect_separate_proto_eval_outputs(self, loader: DataLoader) -> Dict[str, 
             collected["u_joint"].append(u_joint.detach().cpu().numpy())
             collected["q1"].append(q1.detach().cpu().numpy())
             collected["q2"].append(q2.detach().cpu().numpy())
+            collected["proto_dist_matrix1"].append(proto_dist_matrix1.detach().cpu().numpy())
+            collected["proto_dist_matrix2"].append(proto_dist_matrix2.detach().cpu().numpy())
             collected["proto_dist1"].append(proto_dist1.detach().cpu().numpy())
             collected["proto_dist2"].append(proto_dist2.detach().cpu().numpy())
             collected["pred1"].append(pred1.detach().cpu().numpy())
@@ -831,33 +886,33 @@ def _test_dual_separate_proto(self):
     train_outputs = self._collect_pointwise_separate_proto_eval_outputs(self.train_eval_loader)
     test_outputs = self._collect_pointwise_separate_proto_eval_outputs(self.test_loader)
 
-    recon_weight = float(getattr(self.config, "prototype_recon_weight", getattr(self.config, "dual_view_recon_weight", 0.5)))
-    lambda_js = float(getattr(self.config, "lambda_js_score", getattr(self.config, "dual_score_weight_cv", 1.0)))
-    train_score, train_components = compute_separate_proto_anomaly_score(
-        train_outputs["proto_dist1"],
-        train_outputs["proto_dist2"],
+    train_prev = previous_indices_from_point_indices(train_outputs["point_indices"])
+    test_prev = previous_indices_from_point_indices(test_outputs["point_indices"])
+    eps = float(getattr(self.config, "robust_eps", 1e-6))
+
+    train_components = compute_separate_proto_component_scores(
+        train_outputs["proto_dist_matrix1"],
+        train_outputs["proto_dist_matrix2"],
         train_outputs["recon1"],
         train_outputs["recon2"],
         train_outputs["q1"],
         train_outputs["q2"],
-        recon_weight=recon_weight,
-        lambda_js=lambda_js,
-        eps=float(getattr(self.config, "robust_eps", 1e-6)),
+        q1_prev=train_outputs["q1"][train_prev],
+        q2_prev=train_outputs["q2"][train_prev],
+        eps=eps,
     )
-    test_score, components = compute_separate_proto_anomaly_score(
-        test_outputs["proto_dist1"],
-        test_outputs["proto_dist2"],
+    components = compute_separate_proto_component_scores(
+        test_outputs["proto_dist_matrix1"],
+        test_outputs["proto_dist_matrix2"],
         test_outputs["recon1"],
         test_outputs["recon2"],
         test_outputs["q1"],
         test_outputs["q2"],
-        recon_weight=recon_weight,
-        lambda_js=lambda_js,
-        eps=float(getattr(self.config, "robust_eps", 1e-6)),
+        q1_prev=test_outputs["q1"][test_prev],
+        q2_prev=test_outputs["q2"][test_prev],
+        eps=eps,
     )
 
-    threshold = float(np.quantile(train_score, self.config.decision_quantile))
-    pred_labels = (test_score > threshold).astype(np.int64)
     y_true = test_outputs["point_labels"]
     y_count = y_true.astype(np.int64)
     print(
@@ -865,24 +920,16 @@ def _test_dual_separate_proto(self):
         f"anomaly={int(np.sum(y_true == 1))} | total={int(y_true.shape[0])}"
     )
     distance_analysis = self._analyze_test_latent_distances(test_outputs["u_joint"], y_true)
-    metrics = combine_all_evaluation_scores(y_true.copy(), pred_labels.copy(), test_score.copy())
     proto_head = self.model.prototype_head_v1
 
     print(
-        f"{family_label} prototype scoring: "
-        f"score=max(proto_dist+{recon_weight:.3f}*recon)+{lambda_js:.3f}*JS(q1,q2) | "
+        f"{family_label} component scoring: "
+        "no fused score emitted | "
+        "scores=score_recon_v1,score_recon_v2,score_proto_v1,score_proto_v2,"
+        "score_dist_gap,score_cross_view_js,score_temporal_js | "
         f"K={int(getattr(proto_head, 'num_prototypes', 0))} | "
         f"state_dim={int(getattr(self.model, 'state_dim', 0))}"
     )
-    print(f"Threshold (train quantile {self.config.decision_quantile:.4f}): {threshold:.6f}")
-    pred_anomaly_idx = np.where(pred_labels == 1)[0].astype(np.int64)
-    pred_anomaly_counts = y_count[pred_anomaly_idx] if pred_anomaly_idx.size > 0 else np.empty(0, dtype=np.int64)
-    print(
-        f"[Test][{family_label}Proto] Pred anomaly point indices with labels: "
-        f"{self._format_index_count_preview(test_outputs['point_indices'][pred_anomaly_idx], pred_anomaly_counts)}"
-    )
-    for key, value in metrics.items():
-        print(f"{key}: {float(value):.6f}")
 
     components.update(
         {
@@ -903,155 +950,46 @@ def _test_dual_separate_proto(self):
         }
     )
 
-    view1_proto_metrics, view1_proto_pred, view1_proto_threshold = self._evaluate_score_family(
-        label=f"{family_label}View1ProtoDist",
-        train_scores=train_components["view1_proto_dist"],
-        test_scores=components["view1_proto_dist"],
-        y_true=y_true,
-        y_count=y_count,
-        item_indices=test_outputs["point_indices"],
-        item_name="point",
-    )
-    view1_recon_metrics, view1_recon_pred, view1_recon_threshold = self._evaluate_score_family(
-        label=f"{family_label}View1Recon",
-        train_scores=train_components["view1_recon"],
-        test_scores=components["view1_recon"],
-        y_true=y_true,
-        y_count=y_count,
-        item_indices=test_outputs["point_indices"],
-        item_name="point",
-    )
-    view2_proto_metrics, view2_proto_pred, view2_proto_threshold = self._evaluate_score_family(
-        label=f"{family_label}View2ProtoDist",
-        train_scores=train_components["view2_proto_dist"],
-        test_scores=components["view2_proto_dist"],
-        y_true=y_true,
-        y_count=y_count,
-        item_indices=test_outputs["point_indices"],
-        item_name="point",
-    )
-    view2_recon_metrics, view2_recon_pred, view2_recon_threshold = self._evaluate_score_family(
-        label=f"{family_label}View2Recon",
-        train_scores=train_components["view2_recon"],
-        test_scores=components["view2_recon"],
-        y_true=y_true,
-        y_count=y_count,
-        item_indices=test_outputs["point_indices"],
-        item_name="point",
-    )
-    view1_metrics, view1_pred, view1_threshold = self._evaluate_score_family(
-        label=f"{family_label}View1Evidence",
-        train_scores=train_components["view1"],
-        test_scores=components["view1"],
-        y_true=y_true,
-        y_count=y_count,
-        item_indices=test_outputs["point_indices"],
-        item_name="point",
-    )
-    view2_metrics, view2_pred, view2_threshold = self._evaluate_score_family(
-        label=f"{family_label}View2Evidence",
-        train_scores=train_components["view2"],
-        test_scores=components["view2"],
-        y_true=y_true,
-        y_count=y_count,
-        item_indices=test_outputs["point_indices"],
-        item_name="point",
-    )
-    js_metrics, js_pred, js_threshold = self._evaluate_score_family(
-        label=f"{family_label}JSConflict",
-        train_scores=train_components["js_conflict"],
-        test_scores=components["js_conflict"],
-        y_true=y_true,
-        y_count=y_count,
-        item_indices=test_outputs["point_indices"],
-        item_name="point",
-    )
-    proto_gap_metrics, proto_gap_pred, proto_gap_threshold = self._evaluate_score_family(
-        label=f"{family_label}ProtoDistGap",
-        train_scores=train_components["proto_dist_gap"],
-        test_scores=components["proto_dist_gap"],
-        y_true=y_true,
-        y_count=y_count,
-        item_indices=test_outputs["point_indices"],
-        item_name="point",
-    )
+    score_specs = [
+        ("score_recon_v1", f"{family_label}ScoreReconV1"),
+        ("score_recon_v2", f"{family_label}ScoreReconV2"),
+        ("score_proto_v1", f"{family_label}ScoreProtoV1"),
+        ("score_proto_v2", f"{family_label}ScoreProtoV2"),
+        ("score_dist_gap", f"{family_label}ScoreDistGap"),
+        ("score_cross_view_js", f"{family_label}ScoreCrossViewJS"),
+        ("score_temporal_js", f"{family_label}ScoreTemporalJS"),
+    ]
+    component_families = {}
+    for score_key, score_label in score_specs:
+        family_metrics, family_pred, family_threshold = self._evaluate_score_family(
+            label=score_label,
+            train_scores=train_components[score_key],
+            test_scores=components[score_key],
+            y_true=y_true,
+            y_count=y_count,
+            item_indices=test_outputs["point_indices"],
+            item_name="point",
+        )
+        component_families[score_key] = {
+            "metrics": family_metrics,
+            "threshold": family_threshold,
+            "train_scores": train_components[score_key],
+            "test_scores": components[score_key],
+            "pred_labels": family_pred,
+        }
 
     return {
-        "metrics": metrics,
-        "threshold": threshold,
+        "metrics": {},
+        "threshold": None,
         "y_true": y_true,
-        "pred_labels": pred_labels,
-        "scores": test_score.astype(np.float32),
+        "pred_labels": None,
+        "scores": None,
         "components": components,
         "train_components": train_components,
-        "score_name": "separate_proto_max_evidence_js",
+        "score_name": "separate_proto_component_scores_only",
         "test_features": test_outputs["u_joint"],
         "distance_analysis": distance_analysis,
-        "component_families": {
-            "view1_proto_dist": {
-                "metrics": view1_proto_metrics,
-                "threshold": view1_proto_threshold,
-                "train_scores": train_components["view1_proto_dist"],
-                "test_scores": components["view1_proto_dist"],
-                "pred_labels": view1_proto_pred,
-            },
-            "view1_recon": {
-                "metrics": view1_recon_metrics,
-                "threshold": view1_recon_threshold,
-                "train_scores": train_components["view1_recon"],
-                "test_scores": components["view1_recon"],
-                "pred_labels": view1_recon_pred,
-            },
-            "view2_proto_dist": {
-                "metrics": view2_proto_metrics,
-                "threshold": view2_proto_threshold,
-                "train_scores": train_components["view2_proto_dist"],
-                "test_scores": components["view2_proto_dist"],
-                "pred_labels": view2_proto_pred,
-            },
-            "view2_recon": {
-                "metrics": view2_recon_metrics,
-                "threshold": view2_recon_threshold,
-                "train_scores": train_components["view2_recon"],
-                "test_scores": components["view2_recon"],
-                "pred_labels": view2_recon_pred,
-            },
-            "js_conflict": {
-                "metrics": js_metrics,
-                "threshold": js_threshold,
-                "train_scores": train_components["js_conflict"],
-                "test_scores": components["js_conflict"],
-                "pred_labels": js_pred,
-            },
-            "proto_dist_gap": {
-                "metrics": proto_gap_metrics,
-                "threshold": proto_gap_threshold,
-                "train_scores": train_components["proto_dist_gap"],
-                "test_scores": components["proto_dist_gap"],
-                "pred_labels": proto_gap_pred,
-            },
-        },
-        "center_distance": {
-            "metrics": view1_metrics,
-            "threshold": view1_threshold,
-            "train_scores": train_components["view1"],
-            "test_scores": components["view1"],
-            "pred_labels": view1_pred,
-        },
-        "reconstruction": {
-            "metrics": view2_metrics,
-            "threshold": view2_threshold,
-            "train_scores": train_components["view2"],
-            "test_scores": components["view2"],
-            "pred_labels": view2_pred,
-        },
-        "cross_view": {
-            "metrics": js_metrics,
-            "threshold": js_threshold,
-            "train_scores": train_components["js_conflict"],
-            "test_scores": components["js_conflict"],
-            "pred_labels": js_pred,
-        },
+        "component_families": component_families,
         "banks": self._export_bank_artifacts(),
     }
 

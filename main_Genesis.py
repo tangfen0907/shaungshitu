@@ -18,7 +18,7 @@ LOCAL_CONFIG_OVERRIDES = {
     # Dual-view encoder
     'active_view': 'dual',
     'dual_view_feature_mode': 'avg',
-    'latent_dim': 96,
+    'latent_dim': 64,
     'dual_history_len': 20,
     'dual_current_out': 8,
     'dual_short_out': 16,
@@ -28,10 +28,10 @@ LOCAL_CONFIG_OVERRIDES = {
     'epoch_stage0': 10,
     'epoch_stage1': 10,
     # 'epoch_stage2': 20,
-    'num_stage2_rounds':10,
+    'num_stage2_rounds':20,
     'stage2_a_epochs': 1,
     'stage2_b_epochs': 1,
-    'batch_size': 64,
+    'batch_size': 256,
     'lr': 1e-3,
     'weight_decay': 1e-5,
 

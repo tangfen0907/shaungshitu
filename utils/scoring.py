@@ -8,8 +8,11 @@ __all__ = [
     '_robust_positive',
     '_rank01',
     '_robust_positive_norm',
+    'previous_indices_from_point_indices',
     'js_divergence_np',
     'entropy_np',
+    'distance_vector_gap_np',
+    'compute_separate_proto_component_scores',
     'compute_separate_proto_anomaly_score',
 ]
 
@@ -63,6 +66,15 @@ def _robust_positive_norm(values: np.ndarray, cap: float = 2.5) -> np.ndarray:
     return normalized.astype(np.float32)
 
 
+def previous_indices_from_point_indices(point_indices: np.ndarray) -> np.ndarray:
+    point_indices = np.asarray(point_indices, dtype=np.int64).reshape(-1)
+    prev_indices = np.arange(point_indices.shape[0], dtype=np.int64)
+    row_by_point = {int(point): int(row) for row, point in enumerate(point_indices)}
+    for row, point in enumerate(point_indices):
+        prev_indices[row] = int(row_by_point.get(int(point) - 1, row))
+    return prev_indices
+
+
 def js_divergence_np(q1: np.ndarray, q2: np.ndarray, eps: float = 1e-8) -> np.ndarray:
     q1 = np.asarray(q1, dtype=np.float32)
     q2 = np.asarray(q2, dtype=np.float32)
@@ -83,6 +95,73 @@ def entropy_np(q: np.ndarray, eps: float = 1e-8) -> np.ndarray:
     q = np.maximum(q, float(eps))
     q = q / np.maximum(np.sum(q, axis=1, keepdims=True), float(eps))
     return (-np.sum(q * np.log(q), axis=1)).astype(np.float32)
+
+
+def distance_vector_gap_np(D1: np.ndarray, D2: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    D1 = np.asarray(D1, dtype=np.float32)
+    D2 = np.asarray(D2, dtype=np.float32)
+    if D1.shape != D2.shape:
+        raise ValueError("D1 and D2 should have the same shape.")
+    if D1.ndim != 2:
+        raise ValueError("Distance vectors should be a 2D array [N, K].")
+    D1_norm = D1 / np.maximum(np.mean(D1, axis=1, keepdims=True), float(eps))
+    D2_norm = D2 / np.maximum(np.mean(D2, axis=1, keepdims=True), float(eps))
+    return np.mean((D1_norm - D2_norm) ** 2, axis=1).astype(np.float32)
+
+
+def compute_separate_proto_component_scores(
+    proto_dist_matrix1: np.ndarray,
+    proto_dist_matrix2: np.ndarray,
+    recon1: np.ndarray,
+    recon2: np.ndarray,
+    q1: np.ndarray,
+    q2: np.ndarray,
+    q1_prev: np.ndarray = None,
+    q2_prev: np.ndarray = None,
+    eps: float = 1e-8,
+) -> Dict[str, np.ndarray]:
+    D1 = np.asarray(proto_dist_matrix1, dtype=np.float32)
+    D2 = np.asarray(proto_dist_matrix2, dtype=np.float32)
+    if D1.shape != D2.shape:
+        raise ValueError("Prototype distance matrices should have the same shape.")
+    if D1.ndim != 2:
+        raise ValueError("Prototype distance matrices should be [N, K].")
+
+    recon1 = np.asarray(recon1, dtype=np.float32).reshape(-1)
+    recon2 = np.asarray(recon2, dtype=np.float32).reshape(-1)
+    if not (D1.shape[0] == recon1.shape[0] == recon2.shape[0]):
+        raise ValueError("Distance matrices and reconstruction scores should align.")
+
+    q1 = np.asarray(q1, dtype=np.float32)
+    q2 = np.asarray(q2, dtype=np.float32)
+    if q1_prev is None:
+        q1_prev = q1
+    if q2_prev is None:
+        q2_prev = q2
+    q1_prev = np.asarray(q1_prev, dtype=np.float32)
+    q2_prev = np.asarray(q2_prev, dtype=np.float32)
+
+    score_proto_v1 = np.min(D1, axis=1).astype(np.float32)
+    score_proto_v2 = np.min(D2, axis=1).astype(np.float32)
+    score_dist_gap = distance_vector_gap_np(D1, D2, eps=float(eps))
+    score_cross_view_js = (
+        js_divergence_np(q1, q2, eps=float(eps))
+        + js_divergence_np(q1_prev, q2_prev, eps=float(eps))
+    ).astype(np.float32)
+    score_temporal_js = (
+        js_divergence_np(q1, q1_prev, eps=float(eps))
+        + js_divergence_np(q2, q2_prev, eps=float(eps))
+    ).astype(np.float32)
+
+    return {
+        "score_recon_v1": recon1.astype(np.float32),
+        "score_recon_v2": recon2.astype(np.float32),
+        "score_proto_v1": score_proto_v1,
+        "score_proto_v2": score_proto_v2,
+        "score_dist_gap": score_dist_gap,
+        "score_cross_view_js": score_cross_view_js,
+        "score_temporal_js": score_temporal_js,
+    }
 
 
 def compute_separate_proto_anomaly_score(

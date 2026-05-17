@@ -126,12 +126,13 @@ def load_json_overrides(path: Optional[str]) -> Dict[str, object]:
 
 def print_score_family_results(results: dict):
     separated_labels = [
-        ("view1_proto_dist", "View1 prototype-distance score"),
-        ("view1_recon", "View1 reconstruction score"),
-        ("view2_proto_dist", "View2 prototype-distance score"),
-        ("view2_recon", "View2 reconstruction score"),
-        ("proto_dist_gap", "Cross-view prototype-distance gap score"),
-        ("js_conflict", "Cross-view JS/conflict score"),
+        ("score_recon_v1", "score_recon_v1: View1 reconstruction score"),
+        ("score_recon_v2", "score_recon_v2: View2 reconstruction score"),
+        ("score_proto_v1", "score_proto_v1: View1 nearest-prototype squared distance"),
+        ("score_proto_v2", "score_proto_v2: View2 nearest-prototype squared distance"),
+        ("score_dist_gap", "score_dist_gap: normalized full-distance-vector gap"),
+        ("score_cross_view_js", "score_cross_view_js: JS(A1,A2)+JS(B1,B2)"),
+        ("score_temporal_js", "score_temporal_js: JS(A1,B1)+JS(A2,B2)"),
     ]
     component_families = results.get("component_families", {})
     for key, label in separated_labels:
@@ -395,8 +396,12 @@ def run_training(
                 print_visualization_artifacts(run_dir, experiment_name)
 
             print(f"\n========== {experiment_name} Final Results ==========")
-            for key, value in results["metrics"].items():
-                print(f"{key}: {value:.6f}")
+            metrics = results.get("metrics", {})
+            if metrics:
+                for key, value in metrics.items():
+                    print(f"{key}: {value:.6f}")
+            else:
+                print("No fused anomaly score emitted; reporting component score families only.")
             print_score_family_results(results)
             print(f"\nRun artifacts saved under: {os.path.abspath(run_dir)}")
 
@@ -441,8 +446,12 @@ def run_evaluation(
                 print_visualization_artifacts(run_dir, experiment_name)
 
             print(f"\n========== {experiment_name} Eval Results ==========")
-            for key, value in results["metrics"].items():
-                print(f"{key}: {value:.6f}")
+            metrics = results.get("metrics", {})
+            if metrics:
+                for key, value in metrics.items():
+                    print(f"{key}: {value:.6f}")
+            else:
+                print("No fused anomaly score emitted; reporting component score families only.")
             print_score_family_results(results)
             print(f"\nEval artifacts saved under: {os.path.abspath(run_dir)}")
 

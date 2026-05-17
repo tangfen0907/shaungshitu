@@ -27,6 +27,7 @@ def run_train_loop(solver):
         self._stage0_epoch(epoch)
     self._trim_active_training_pool("stage0")
     self._save_dual_truth_visualizations("stage0")
+    self._save_stage_checkpoint("stage0")
 
     print("========== Stage A1: Local-window Anomaly Separation ==========")
     print(
@@ -75,6 +76,7 @@ def run_train_loop(solver):
         )
     self._trim_active_training_pool("stage1")
     self._save_dual_truth_visualizations("stage1")
+    self._save_stage_checkpoint("stage1")
 
     print("========== Stage 2: Prototype A/B Refinement ==========")
     num_stage2_rounds, stage2_a_epochs, stage2_b_epochs = self._resolve_stage2_schedule()

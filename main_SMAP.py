@@ -18,7 +18,7 @@ LOCAL_CONFIG_OVERRIDES = {
     # Dual-view encoder
     'active_view': 'dual',
     'dual_view_feature_mode': 'avg',
-    'latent_dim': 96,
+    'latent_dim': 512,
     'dual_history_len': 20,
     'dual_current_out': 8,
     'dual_short_out': 24,
