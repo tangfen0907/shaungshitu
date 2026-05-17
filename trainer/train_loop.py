@@ -25,33 +25,40 @@ def run_train_loop(solver):
     print("========== Stage A0: Unlabeled-train Reconstruction Warmup ==========")
     for epoch in range(1, self.config.epoch_stage0 + 1):
         self._stage0_epoch(epoch)
-    self._save_dual_truth_visualizations("stage0")
     self._trim_active_training_pool("stage0")
+    self._save_dual_truth_visualizations("stage0")
 
-    print("========== Stage A1: Last-context Anomaly Separation ==========")
+    print("========== Stage A1: Local-window Anomaly Separation ==========")
     print(
         "[StageA1] setup | "
-        "reconstruction=full_window | "
-        "negative=inject_last_context | "
+        "reconstruction=current_point | "
+        "negative=inject_local_L_window | "
+        "positive=X_t_minus_1 | "
+        "geometry=raw_l2_squared | "
+        "away=absolute_margin | "
         f"context_len={self._inject_context_len('stage1')} | "
-        f"lambda_away={float(getattr(self.config, 'lambda_away_stage1', 0.05)):.3f} | "
-        f"margin={float(getattr(self.config, 'margin_stage1', 1.0)):.3f}"
+        f"lambda_triplet={float(getattr(self.config, 'lambda_stage1_triplet', 1.0)):.3f} | "
+        f"lambda_cv={float(getattr(self.config, 'lambda_cv_stage1', 0.2)):.3f} | "
+        f"triplet_margin={float(getattr(self.config, 'stage1_triplet_margin', 0.3)):.3f}"
     )
     if self._is_dual_view_model():
         channels = int(getattr(self.config, "in_channels", 0))
-        history_len = int(getattr(self.config, "dual_history_len", 20))
-        current_out = int(getattr(self.config, "dual_current_out", 8))
-        short_out = int(getattr(self.config, "dual_short_out", 16))
-        long_out = int(getattr(self.config, "dual_long_out", 16))
+        history_len = int(getattr(self.config, "seq_len", getattr(self.config, "dual_history_len", 20)))
+        short_len = max(1, history_len // 2)
+        flat_len = channels * history_len
+        flat_short_len = max(1, flat_len // 2)
+        view1_dim = channels * (history_len - short_len + 2) + history_len
+        view2_dim = flat_len - flat_short_len + 2
         print(
             "[Encoder] setup | "
-            "pointwise_dual | "
+            "local_window_dual | "
+            "input=[B,M,L] | output H1/H2=[B,d_model] | "
             f"L={history_len} | "
-            f"F1_dim={3 * channels + history_len} | "
-            f"F2_dim={current_out + short_out + long_out} "
-            f"({current_out}+{short_out}+{long_out}) | "
+            f"M={channels} | "
+            f"F1_dim={view1_dim} | "
+            f"F2_dim={view2_dim} | "
             f"d_model={int(getattr(self.config, 'latent_dim', 0))} | "
-            "reconstruction=full_window"
+            "reconstruction=current_point"
         )
     else:
         print(
@@ -66,8 +73,8 @@ def run_train_loop(solver):
             total_epoch=self.config.epoch_stage1,
             stage_name="StageA1",
         )
-    self._save_dual_truth_visualizations("stage1")
     self._trim_active_training_pool("stage1")
+    self._save_dual_truth_visualizations("stage1")
 
     print("========== Stage 2: Prototype A/B Refinement ==========")
     num_stage2_rounds, stage2_a_epochs, stage2_b_epochs = self._resolve_stage2_schedule()
@@ -83,14 +90,16 @@ def run_train_loop(solver):
         f"state_dim={int(getattr(self.config, 'state_dim', 0))} | "
         f"active_pool={self._active_pool_summary_text()} | "
         f"A=(core={float(getattr(self.config, 'core_ratio_A', 0.5)):.3f}, "
-        f"pull={float(getattr(self.config, 'lambda_pull_A', 1.0)):.3f}, "
-        f"sep={float(getattr(self.config, 'lambda_sep_A', 0.1)):.3f}, "
-        f"pair={float(getattr(self.config, 'lambda_pair_A', 0.1)):.3f}) | "
+        f"proto_momentum={float(getattr(self.config, 'proto_momentum', 0.8)):.3f}, "
+        f"pair_align_strength={float(getattr(self.config, 'pair_align_strength', 0.2)):.3f}, "
+        f"alpha={float(getattr(self.config, 'alpha_A', 1.0)):.3f}, "
+        f"beta={float(getattr(self.config, 'beta_A', 1.0)):.3f}, "
+        f"gamma={float(getattr(self.config, 'gamma_A', 0.5)):.3f}) | "
         f"B=(core={float(getattr(self.config, 'core_ratio_B', 0.5)):.3f}, "
         f"rec={float(getattr(self.config, 'lambda_rec_B', 1.0)):.3f}, "
         f"pull={float(getattr(self.config, 'lambda_pull_B', 0.5)):.3f}, "
         f"align={float(getattr(self.config, 'lambda_align_B', 0.05)):.3f}, "
-        f"delta={float(getattr(self.config, 'lambda_delta_B', 0.05)):.3f}, "
+        "delta=off, "
         f"anom={float(getattr(self.config, 'lambda_anom_B', 0.05)):.3f})"
     )
     title = "Dual-View Aligned Prototype Learning"

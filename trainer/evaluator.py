@@ -21,7 +21,7 @@ except Exception:
     _VUS_AVAILABLE = False
 
 
-__all__ = ['_build_window_anomaly_flags', '_build_window_anomaly_counts', '_nearest_center_scores', '_threshold_scores', '_pairwise_distance_block', '_init_distance_stats', '_update_distance_stats', '_summarize_distance_stats', '_within_class_distance_stats', '_cross_class_distance_stats', '_sample_within_class_distances', '_sample_cross_class_distances', '_select_distance_analysis_subset', '_analyze_test_latent_distances', '_collect_reconstruction_scores', '_collect_dual_reconstruction_scores', '_cross_view_disagreement_from_evidence', '_save_stage1_reconstruction_scoring', '_format_index_count_preview', '_evaluate_score_family', '_normalize_score_pair', '_collect_cross_view_scores', '_collect_separate_proto_eval_outputs', '_test_dual_separate_proto', 'run_evaluation']
+__all__ = ['_extract_label_window', '_build_window_anomaly_flags', '_build_window_anomaly_counts', '_build_point_anomaly_labels', '_build_point_anomaly_counts', '_dataset_point_window_indices', '_nearest_center_scores', '_threshold_scores', '_pairwise_distance_block', '_init_distance_stats', '_update_distance_stats', '_summarize_distance_stats', '_within_class_distance_stats', '_cross_class_distance_stats', '_sample_within_class_distances', '_sample_cross_class_distances', '_select_distance_analysis_subset', '_analyze_test_latent_distances', '_collect_reconstruction_scores', '_collect_dual_reconstruction_scores', '_cross_view_disagreement_from_evidence', '_save_stage1_reconstruction_scoring', '_format_index_count_preview', '_evaluate_score_family', '_normalize_score_pair', '_collect_cross_view_scores', '_collect_pointwise_separate_proto_eval_outputs', '_collect_separate_proto_eval_outputs', '_test_dual_separate_proto', 'run_evaluation']
 
 
 def combine_all_evaluation_scores(y_test, pred_labels, anomaly_scores):
@@ -66,6 +66,14 @@ def combine_all_evaluation_scores(y_test, pred_labels, anomaly_scores):
     }
 
 
+@staticmethod
+def _extract_label_window(sample):
+    """Return label_window from dataset samples shaped as (window, label_window)."""
+    if isinstance(sample, (tuple, list)) and len(sample) >= 2:
+        return sample[1]
+    return None
+
+
 def _build_window_anomaly_flags(self, dataset) -> np.ndarray:
     flags = np.zeros(len(dataset), dtype=np.int64)
     for idx in range(len(dataset)):
@@ -86,6 +94,51 @@ def _build_window_anomaly_counts(self, dataset) -> np.ndarray:
         label_array = np.asarray(labels, dtype=np.float32).reshape(-1)
         counts[idx] = int(np.sum(label_array > 0))
     return counts
+
+
+def _build_point_anomaly_labels(self, dataset) -> np.ndarray:
+    dataset_mode = str(getattr(dataset, "mode", "train")).strip().lower()
+    if dataset_mode == "train":
+        labels = getattr(dataset, "train_labels", None)
+        data = getattr(dataset, "train", None)
+    else:
+        labels = getattr(dataset, "test_labels", None)
+        data = getattr(dataset, "test", None)
+
+    current = getattr(dataset, "base_dataset", None)
+    while labels is None and current is not None:
+        dataset_mode = str(getattr(current, "mode", dataset_mode)).strip().lower()
+        if dataset_mode == "train":
+            labels = getattr(current, "train_labels", None)
+            data = getattr(current, "train", data)
+        else:
+            labels = getattr(current, "test_labels", None)
+            data = getattr(current, "test", data)
+        current = getattr(current, "base_dataset", getattr(current, "dataset", None))
+
+    if labels is not None:
+        return np.asarray(labels, dtype=np.float32).reshape(-1).astype(np.int64)
+    if data is not None:
+        return np.zeros(int(np.asarray(data).shape[0]), dtype=np.int64)
+
+    win_size = int(getattr(dataset, "win_size", self.config.seq_len))
+    step = int(getattr(dataset, "step", 1))
+    total_points = max(0, (int(len(dataset)) - 1) * step + win_size)
+    return np.zeros(total_points, dtype=np.int64)
+
+
+def _build_point_anomaly_counts(self, dataset) -> np.ndarray:
+    # Kept as a count-like array so the existing logging helper can be reused.
+    return self._build_point_anomaly_labels(dataset).astype(np.int64)
+
+
+@staticmethod
+def _dataset_point_window_indices(dataset) -> np.ndarray:
+    if hasattr(dataset, "original_indices"):
+        return np.asarray(getattr(dataset, "original_indices"), dtype=np.int64).reshape(-1)
+    if hasattr(dataset, "indices"):
+        return np.asarray(getattr(dataset, "indices"), dtype=np.int64).reshape(-1)
+    return np.arange(len(dataset), dtype=np.int64)
 
 
 @staticmethod
@@ -523,6 +576,8 @@ def _evaluate_score_family(
     test_scores: np.ndarray,
     y_true: np.ndarray,
     y_count: np.ndarray,
+    item_indices: np.ndarray = None,
+    item_name: str = "window",
 ) -> Tuple[Dict[str, float], np.ndarray, float]:
     train_scores = np.asarray(train_scores, dtype=np.float32).reshape(-1)
     test_scores = np.asarray(test_scores, dtype=np.float32).reshape(-1)
@@ -531,6 +586,11 @@ def _evaluate_score_family(
     metrics = {str(key): float(value) for key, value in metrics.items()}
     pred_anomaly_idx = np.where(pred_labels == 1)[0].astype(np.int64)
     pred_anomaly_counts = y_count[pred_anomaly_idx] if pred_anomaly_idx.size > 0 else np.empty(0, dtype=np.int64)
+    display_indices = (
+        np.asarray(item_indices, dtype=np.int64).reshape(-1)[pred_anomaly_idx]
+        if item_indices is not None
+        else pred_anomaly_idx
+    )
 
     print(
         f"[Test][{label}] "
@@ -541,8 +601,8 @@ def _evaluate_score_family(
         f"pred_anomaly={int(pred_anomaly_idx.size)}"
     )
     print(
-        f"[Test][{label}] Pred anomaly window indices with anomaly-count: "
-        f"{self._format_index_count_preview(pred_anomaly_idx, pred_anomaly_counts)}"
+        f"[Test][{label}] Pred anomaly {item_name} indices with label/count: "
+        f"{self._format_index_count_preview(display_indices, pred_anomaly_counts)}"
     )
     for key, value in metrics.items():
         print(f"[Test][{label}] {key}: {value:.6f}")
@@ -582,6 +642,115 @@ def _collect_cross_view_scores(self, loader: DataLoader) -> np.ndarray:
         self.model.train()
     return np.concatenate(scores, axis=0).astype(np.float32)
 
+
+def _collect_pointwise_separate_proto_eval_outputs(self, loader: DataLoader) -> Dict[str, np.ndarray]:
+    """
+    Collect one current-point score vector per local L-window.
+
+    New route semantics: each dataset sample is X_t=[x_{t-L+1},...,x_t]
+    and the model outputs H_t only. Therefore the correct label is the last
+    label in the returned label window, not window-any and not an average over
+    duplicate appearances from a T=100 point-level encoder.
+    """
+    if not self._is_dual_view_model():
+        raise RuntimeError("Current-point prototype scoring requires the dual-view model.")
+
+    dataset = loader.dataset
+    window_indices = self._dataset_point_window_indices(dataset)
+
+    def _chain_attr(name: str, default=None):
+        current = dataset
+        seen = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if hasattr(current, name):
+                value = getattr(current, name)
+                if value is not None:
+                    return value
+            current = getattr(current, "base_dataset", getattr(current, "dataset", None))
+        return default
+
+    step = int(_chain_attr("step", 1))
+    win_size = int(_chain_attr("win_size", getattr(self.config, "seq_len", 1)))
+    current_point_offset = int(_chain_attr("current_point_offset", max(0, win_size - 1)))
+
+    collected = {
+        "u1": [],
+        "u2": [],
+        "u_joint": [],
+        "q1": [],
+        "q2": [],
+        "proto_dist1": [],
+        "proto_dist2": [],
+        "pred1": [],
+        "pred2": [],
+        "conf1": [],
+        "conf2": [],
+        "recon1": [],
+        "recon2": [],
+        "point_labels": [],
+        "point_indices": [],
+    }
+
+    cursor = 0
+    was_training = self.model.training
+    self.model.eval()
+
+    with torch.inference_mode():
+        for batch in loader:
+            x = self._prepare_batch(batch)
+            outputs = self.model(x, stage="test")
+            h1 = outputs["H1"]
+            h2 = outputs["H2"]
+            u_joint = torch.nn.functional.normalize(torch.cat([h1, h2], dim=1), dim=1)
+            recon1 = self._mse_per_sample(x, outputs["x_hat1"], view="v1")
+            recon2 = self._mse_per_sample(x, outputs["x_hat2"], view="v2")
+
+            batch_size = int(x.size(0))
+            batch_window_indices = window_indices[cursor:cursor + batch_size]
+            point_indices = batch_window_indices.astype(np.int64) * int(step) + current_point_offset
+
+            if isinstance(batch, (tuple, list)) and len(batch) >= 2:
+                labels_raw = batch[1]
+                if isinstance(labels_raw, torch.Tensor):
+                    labels_np = labels_raw.detach().cpu().numpy()
+                else:
+                    labels_np = np.asarray(labels_raw)
+                labels_np = labels_np.reshape(batch_size, -1)
+                point_labels = (labels_np[:, -1] > 0).astype(np.int64)
+            else:
+                point_label_source = self._build_point_anomaly_labels(dataset)
+                safe_indices = np.clip(point_indices, 0, max(0, point_label_source.shape[0] - 1))
+                point_labels = point_label_source[safe_indices].astype(np.int64)
+
+            collected["u1"].append(h1.detach().cpu().numpy())
+            collected["u2"].append(h2.detach().cpu().numpy())
+            collected["u_joint"].append(u_joint.detach().cpu().numpy())
+            collected["q1"].append(outputs["q1"].detach().cpu().numpy())
+            collected["q2"].append(outputs["q2"].detach().cpu().numpy())
+            collected["proto_dist1"].append(outputs["proto_dist1"].detach().cpu().numpy())
+            collected["proto_dist2"].append(outputs["proto_dist2"].detach().cpu().numpy())
+            collected["pred1"].append(outputs["proto_pred1"].detach().cpu().numpy())
+            collected["pred2"].append(outputs["proto_pred2"].detach().cpu().numpy())
+            collected["conf1"].append(outputs["proto_conf1"].detach().cpu().numpy())
+            collected["conf2"].append(outputs["proto_conf2"].detach().cpu().numpy())
+            collected["recon1"].append(recon1.detach().cpu().numpy())
+            collected["recon2"].append(recon2.detach().cpu().numpy())
+            collected["point_labels"].append(point_labels.astype(np.int64))
+            collected["point_indices"].append(point_indices.astype(np.int64))
+            cursor += batch_size
+
+    if was_training:
+        self.model.train()
+
+    if not collected["u1"]:
+        raise RuntimeError("Current-point scoring found no encoded windows.")
+
+    outputs = {}
+    for key, values in collected.items():
+        dtype = np.int64 if key in {"point_labels", "point_indices"} else np.float32
+        outputs[key] = np.concatenate(values, axis=0).astype(dtype)
+    return outputs
 
 def _collect_separate_proto_eval_outputs(self, loader: DataLoader) -> Dict[str, np.ndarray]:
     was_training = self.model.training
@@ -659,8 +828,8 @@ def _test_dual_separate_proto(self):
     self._uses_separate_prototypes()
     family_label = "Separate"
     print(f"========== Testing Dual-View {family_label} Prototypes ==========")
-    train_outputs = self._collect_separate_proto_eval_outputs(self.train_eval_loader)
-    test_outputs = self._collect_separate_proto_eval_outputs(self.test_loader)
+    train_outputs = self._collect_pointwise_separate_proto_eval_outputs(self.train_eval_loader)
+    test_outputs = self._collect_pointwise_separate_proto_eval_outputs(self.test_loader)
 
     recon_weight = float(getattr(self.config, "prototype_recon_weight", getattr(self.config, "dual_view_recon_weight", 0.5)))
     lambda_js = float(getattr(self.config, "lambda_js_score", getattr(self.config, "dual_score_weight_cv", 1.0)))
@@ -689,10 +858,10 @@ def _test_dual_separate_proto(self):
 
     threshold = float(np.quantile(train_score, self.config.decision_quantile))
     pred_labels = (test_score > threshold).astype(np.int64)
-    y_true = self._build_window_anomaly_flags(self.test_loader.dataset)
-    y_count = self._build_window_anomaly_counts(self.test_loader.dataset)
+    y_true = test_outputs["point_labels"]
+    y_count = y_true.astype(np.int64)
     print(
-        f"[Test][Labels] window labels: normal={int(np.sum(y_true == 0))} | "
+        f"[Test][Labels] point labels: normal={int(np.sum(y_true == 0))} | "
         f"anomaly={int(np.sum(y_true == 1))} | total={int(y_true.shape[0])}"
     )
     distance_analysis = self._analyze_test_latent_distances(test_outputs["u_joint"], y_true)
@@ -709,8 +878,8 @@ def _test_dual_separate_proto(self):
     pred_anomaly_idx = np.where(pred_labels == 1)[0].astype(np.int64)
     pred_anomaly_counts = y_count[pred_anomaly_idx] if pred_anomaly_idx.size > 0 else np.empty(0, dtype=np.int64)
     print(
-        f"[Test][{family_label}Proto] Pred anomaly window indices with anomaly-count: "
-        f"{self._format_index_count_preview(pred_anomaly_idx, pred_anomaly_counts)}"
+        f"[Test][{family_label}Proto] Pred anomaly point indices with labels: "
+        f"{self._format_index_count_preview(test_outputs['point_indices'][pred_anomaly_idx], pred_anomaly_counts)}"
     )
     for key, value in metrics.items():
         print(f"{key}: {float(value):.6f}")
@@ -740,6 +909,8 @@ def _test_dual_separate_proto(self):
         test_scores=components["view1_proto_dist"],
         y_true=y_true,
         y_count=y_count,
+        item_indices=test_outputs["point_indices"],
+        item_name="point",
     )
     view1_recon_metrics, view1_recon_pred, view1_recon_threshold = self._evaluate_score_family(
         label=f"{family_label}View1Recon",
@@ -747,6 +918,8 @@ def _test_dual_separate_proto(self):
         test_scores=components["view1_recon"],
         y_true=y_true,
         y_count=y_count,
+        item_indices=test_outputs["point_indices"],
+        item_name="point",
     )
     view2_proto_metrics, view2_proto_pred, view2_proto_threshold = self._evaluate_score_family(
         label=f"{family_label}View2ProtoDist",
@@ -754,6 +927,8 @@ def _test_dual_separate_proto(self):
         test_scores=components["view2_proto_dist"],
         y_true=y_true,
         y_count=y_count,
+        item_indices=test_outputs["point_indices"],
+        item_name="point",
     )
     view2_recon_metrics, view2_recon_pred, view2_recon_threshold = self._evaluate_score_family(
         label=f"{family_label}View2Recon",
@@ -761,6 +936,8 @@ def _test_dual_separate_proto(self):
         test_scores=components["view2_recon"],
         y_true=y_true,
         y_count=y_count,
+        item_indices=test_outputs["point_indices"],
+        item_name="point",
     )
     view1_metrics, view1_pred, view1_threshold = self._evaluate_score_family(
         label=f"{family_label}View1Evidence",
@@ -768,6 +945,8 @@ def _test_dual_separate_proto(self):
         test_scores=components["view1"],
         y_true=y_true,
         y_count=y_count,
+        item_indices=test_outputs["point_indices"],
+        item_name="point",
     )
     view2_metrics, view2_pred, view2_threshold = self._evaluate_score_family(
         label=f"{family_label}View2Evidence",
@@ -775,6 +954,8 @@ def _test_dual_separate_proto(self):
         test_scores=components["view2"],
         y_true=y_true,
         y_count=y_count,
+        item_indices=test_outputs["point_indices"],
+        item_name="point",
     )
     js_metrics, js_pred, js_threshold = self._evaluate_score_family(
         label=f"{family_label}JSConflict",
@@ -782,6 +963,8 @@ def _test_dual_separate_proto(self):
         test_scores=components["js_conflict"],
         y_true=y_true,
         y_count=y_count,
+        item_indices=test_outputs["point_indices"],
+        item_name="point",
     )
     proto_gap_metrics, proto_gap_pred, proto_gap_threshold = self._evaluate_score_family(
         label=f"{family_label}ProtoDistGap",
@@ -789,6 +972,8 @@ def _test_dual_separate_proto(self):
         test_scores=components["proto_dist_gap"],
         y_true=y_true,
         y_count=y_count,
+        item_indices=test_outputs["point_indices"],
+        item_name="point",
     )
 
     return {

@@ -21,8 +21,13 @@ class CachedWindowDataset(Dataset):
     def __init__(self, base_dataset):
         self.source_name = type(base_dataset).__name__
         self.mode = getattr(base_dataset, "mode", None)
+        self.flag = getattr(base_dataset, "flag", None)
         self.step = getattr(base_dataset, "step", 1)
         self.win_size = getattr(base_dataset, "win_size", None)
+        self.left_pad_windows = bool(getattr(base_dataset, "left_pad_windows", False))
+        self.current_point_offset = int(getattr(base_dataset, "current_point_offset", max(0, int(self.win_size or 1) - 1)))
+        if hasattr(base_dataset, "original_indices"):
+            self.original_indices = np.asarray(getattr(base_dataset, "original_indices"), dtype=np.int64)
         if hasattr(base_dataset, "train_labels"):
             self.train_labels = getattr(base_dataset, "train_labels")
         if hasattr(base_dataset, "test_labels"):
@@ -56,6 +61,90 @@ class CachedWindowDataset(Dataset):
         if self.labels is None:
             return self.windows[int(index)]
         return self.windows[int(index)], self.labels[int(index)]
+
+
+class LeftPaddedWindowDataset(Dataset):
+    """
+    Causal local-window dataset for the new route.
+
+    Sample i corresponds to the real current time t=i*step. The returned
+    window is [x_{t-L+1}, ..., x_t]; when t<L-1, the missing left context is
+    padded by repeating the first available point. This gives every real point,
+    including t=0..L-2, its own length-L sample.
+    """
+
+    def __init__(self, base_dataset):
+        self.base_dataset = base_dataset
+        self.source_name = type(base_dataset).__name__
+        self.mode = getattr(base_dataset, "mode", getattr(base_dataset, "flag", "train"))
+        self.flag = getattr(base_dataset, "flag", None)
+        self.step = max(1, int(getattr(base_dataset, "step", 1)))
+        self.win_size = max(1, int(getattr(base_dataset, "win_size", 1)))
+        self.left_pad_windows = True
+        self.current_point_offset = 0
+        if hasattr(base_dataset, "train_labels"):
+            self.train_labels = getattr(base_dataset, "train_labels")
+        if hasattr(base_dataset, "test_labels"):
+            self.test_labels = getattr(base_dataset, "test_labels")
+
+        self.data, self.labels = self._resolve_data_and_labels()
+        self.data = np.asarray(self.data, dtype=np.float32)
+        if self.data.ndim != 2:
+            raise ValueError(f"LeftPaddedWindowDataset expected data [N, M], got {tuple(self.data.shape)}")
+        if self.labels is None:
+            self.labels = np.zeros(self.data.shape[0], dtype=np.float32)
+        self.labels = np.asarray(self.labels, dtype=np.float32).reshape(-1)
+        if self.labels.shape[0] < self.data.shape[0]:
+            padded = np.zeros(self.data.shape[0], dtype=np.float32)
+            padded[: self.labels.shape[0]] = self.labels
+            self.labels = padded
+        elif self.labels.shape[0] > self.data.shape[0]:
+            self.labels = self.labels[: self.data.shape[0]]
+
+    def _resolve_data_and_labels(self):
+        mode = str(self.mode or "train").strip().lower()
+        if mode == "train":
+            data = getattr(self.base_dataset, "train", None)
+            labels = getattr(self.base_dataset, "train_labels", None)
+            if labels is None and data is not None:
+                labels = np.zeros(np.asarray(data).shape[0], dtype=np.float32)
+            return data, labels
+        if mode == "val":
+            data = getattr(self.base_dataset, "val", None)
+            labels = getattr(self.base_dataset, "val_labels", None)
+            if labels is None:
+                labels = getattr(self.base_dataset, "test_labels", None)
+            return data, labels
+        data = getattr(self.base_dataset, "test", None)
+        labels = getattr(self.base_dataset, "test_labels", None)
+        return data, labels
+
+    def __len__(self):
+        if self.data.shape[0] <= 0:
+            return 0
+        return (int(self.data.shape[0]) - 1) // self.step + 1
+
+    def __getitem__(self, index):
+        current_t = int(index) * self.step
+        if current_t >= int(self.data.shape[0]):
+            raise IndexError(index)
+
+        start = current_t - self.win_size + 1
+        if start < 0:
+            pad_count = -start
+            data_prefix = np.repeat(self.data[0:1], pad_count, axis=0)
+            label_prefix = np.repeat(self.labels[0:1], pad_count, axis=0)
+            data_window = np.concatenate([data_prefix, self.data[0:current_t + 1]], axis=0)
+            label_window = np.concatenate([label_prefix, self.labels[0:current_t + 1]], axis=0)
+        else:
+            data_window = self.data[start:current_t + 1]
+            label_window = self.labels[start:current_t + 1]
+
+        if data_window.shape[0] != self.win_size:
+            raise RuntimeError(
+                f"Left-padded window should have L={self.win_size}, got {data_window.shape[0]}."
+            )
+        return np.float32(data_window), np.float32(label_window)
 
 
 def _parse_anomaly_class_list(raw_value):
@@ -684,6 +773,7 @@ def get_loader_segment(
     metadata_path='',
     scaler_fit_mode='train',
     cache_windows=False,
+    left_pad_windows=False,
     pin_memory=False,
 ):
     effective_step = max(1, int(step))
@@ -719,6 +809,9 @@ def get_loader_segment(
             entity_id=entity_id,
             metadata_path=metadata_path,
         )
+    if bool(left_pad_windows):
+        dataset = LeftPaddedWindowDataset(dataset)
+
     shuffle = False
     if mode == 'train':
         shuffle = True

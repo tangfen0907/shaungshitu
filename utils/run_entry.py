@@ -200,20 +200,19 @@ def _encoder_config_summary(config: Config) -> str:
     active_view = str(getattr(config, "active_view", "v1")).strip().lower()
     if active_view == "dual":
         channels = int(getattr(config, "in_channels", 0))
-        history_len = int(getattr(config, "dual_history_len", 20))
-        current_out = int(getattr(config, "dual_current_out", 8))
-        short_out = int(getattr(config, "dual_short_out", 16))
-        long_out = int(getattr(config, "dual_long_out", 16))
-        view1_dim = 3 * channels + history_len
-        view2_dim = current_out + short_out + long_out
+        history_len = int(getattr(config, "seq_len", getattr(config, "dual_history_len", 20)))
+        short_len = max(1, history_len // 2)
+        flat_len = channels * history_len
+        flat_short_len = max(1, flat_len // 2)
+        view1_dim = channels * (history_len - short_len + 2) + history_len
+        view2_dim = flat_len - flat_short_len + 2
         return (
-            "pointwise_dual | "
+            "local_window_dual | input=[B,M,L] -> H=[B,d] | "
             f"L={history_len} | "
+            f"M={channels} | "
             f"view1_dim={view1_dim} | "
-            f"view2_out=({current_out},{short_out},{long_out})"
-            f"->{view2_dim} | "
-            f"view2_kernels=({channels},{(history_len // 2) * channels},{history_len * channels}) | "
-            "reconstruction=full_window"
+            f"view2_dim={view2_dim} | "
+            "reconstruction=current_point"
         )
     return (
         f"tcn_kernel={getattr(config, 'tcn_kernel_size', 3)} | "
@@ -255,6 +254,7 @@ def print_train_summary(config: Config, run_dir: str, run_name: str, experiment_
         f"active_view={getattr(config, 'active_view', 'v1')} | "
         f"dual_feature={getattr(config, 'dual_view_feature_mode', 'avg')} | "
         f"dual_view_evidence=(center={getattr(config, 'dual_view_center_weight', 1.0)}, recon={getattr(config, 'dual_view_recon_weight', 0.5)}) | "
+        f"left_pad_windows={getattr(config, 'left_pad_windows', True)} | "
         f"{_encoder_config_summary(config)} | "
         f"{_encoder_backbone_summary(config)}"
     )
@@ -266,15 +266,19 @@ def print_train_summary(config: Config, run_dir: str, run_name: str, experiment_
         f"seed={config.seed} | "
         f"num_workers={config.num_workers} | "
         f"cache_windows={getattr(config, 'cache_windows', False)} | "
+        f"left_pad_windows={getattr(config, 'left_pad_windows', True)} | "
         f"pin_memory={getattr(config, 'pin_memory', True)} | "
         f"tf32={getattr(config, 'enable_tf32', True)}"
     )
     print(
         "Stage1: "
-        "mode=full_recon+last_context_away | "
-        f"context_len={getattr(config, 'stage1_inject_context_len', 0) or getattr(config, 'dual_history_len', 20)} | "
-        f"lambda_away={getattr(config, 'lambda_away_stage1', 0.05)} | "
-        f"margin={getattr(config, 'margin_stage1', 1.0)}"
+        "mode=full_recon+local_window_APN | "
+        f"context_len={getattr(config, 'stage1_inject_context_len', 0) or getattr(config, 'seq_len', 20)} | "
+        "positive=X_t_minus_1 | "
+        "geometry=raw_l2_squared | "
+        f"lambda_triplet={getattr(config, 'lambda_stage1_triplet', 1.0)} | "
+        f"lambda_cv={getattr(config, 'lambda_cv_stage1', 0.2)} | "
+        f"triplet_margin={getattr(config, 'stage1_triplet_margin', 0.3)}"
     )
     print(
         "Stage2: "
@@ -287,17 +291,21 @@ def print_train_summary(config: Config, run_dir: str, run_name: str, experiment_
         f"state_dim={getattr(config, 'state_dim', 0)} | "
         f"active_pool_trim={getattr(config, 'active_pool_trim_enabled', False)} "
         f"(stage0={getattr(config, 'active_pool_trim_stage0_ratio', 0.0)}, "
-        f"stage1={getattr(config, 'active_pool_trim_stage1_ratio', 0.0)})"
+        f"stage1={getattr(config, 'active_pool_trim_stage1_ratio', 0.0)}) | "
+        "A=prototype_refresh_no_optimizer"
     )
     print(
         "Loss/Score: "
-        f"A=(pull={getattr(config, 'lambda_pull_A', 1.0)}, "
-        f"sep={getattr(config, 'lambda_sep_A', 0.1)}, "
-        f"pair={getattr(config, 'lambda_pair_A', 0.1)}) | "
+        f"A=(core={getattr(config, 'core_ratio_A', 0.3)}, "
+        f"alpha={getattr(config, 'alpha_A', 1.0)}, "
+        f"beta={getattr(config, 'beta_A', 1.0)}, "
+        f"gamma={getattr(config, 'gamma_A', 0.5)}, "
+        f"momentum={getattr(config, 'proto_momentum', 0.8)}, "
+        f"pair_align={getattr(config, 'pair_align_strength', 0.2)}) | "
         f"B=(rec={getattr(config, 'lambda_rec_B', 1.0)}, "
         f"pull={getattr(config, 'lambda_pull_B', 0.5)}, "
         f"align={getattr(config, 'lambda_align_B', 0.05)}, "
-        f"delta={getattr(config, 'lambda_delta_B', 0.05)}, "
+        "delta=off, "
         f"anom={getattr(config, 'lambda_anom_B', 0.05)}) | "
         f"js={getattr(config, 'lambda_js_score', 1.0)} | "
         f"proto_recon={getattr(config, 'prototype_recon_weight', 0.5)} | "

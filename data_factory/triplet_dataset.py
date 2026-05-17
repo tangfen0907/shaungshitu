@@ -15,7 +15,12 @@ def _extract_window(sample: Any) -> Any:
     return sample
 
 
-def _to_channel_first_tensor(window: Any) -> torch.Tensor:
+def _to_channel_first_tensor(
+    window: Any,
+    *,
+    in_channels: int = None,
+    seq_len: int = None,
+) -> torch.Tensor:
     """
     Normalize each window to float tensor [C, L].
     Existing loaders mostly return [L, C], so we transpose when needed.
@@ -30,7 +35,16 @@ def _to_channel_first_tensor(window: Any) -> torch.Tensor:
     if tensor.dim() != 2:
         raise ValueError(f"Window tensor should be 2D, got {tuple(tensor.shape)}")
 
-    if tensor.shape[0] > tensor.shape[1]:
+    if in_channels is not None and seq_len is not None:
+        in_channels = int(in_channels)
+        seq_len = int(seq_len)
+        if tensor.shape[0] == seq_len and tensor.shape[1] == in_channels:
+            tensor = tensor.transpose(0, 1).contiguous()
+        elif tensor.shape[0] == in_channels and tensor.shape[1] == seq_len:
+            tensor = tensor.contiguous()
+        elif tensor.shape[0] > tensor.shape[1]:
+            tensor = tensor.transpose(0, 1).contiguous()
+    elif tensor.shape[0] > tensor.shape[1]:
         tensor = tensor.transpose(0, 1).contiguous()
 
     return tensor
@@ -51,10 +65,14 @@ class Stage1AdjacentPairDataset(Dataset):
         positive_offset: int = 1,
         positive_direction: str = "past",
         active_mask=None,
+        in_channels: int = None,
+        seq_len: int = None,
     ):
         self.base_dataset = base_dataset
         self.positive_offset = max(1, int(positive_offset))
         self.positive_direction = str(positive_direction).strip().lower()
+        self.in_channels = None if in_channels is None else int(in_channels)
+        self.seq_len = None if seq_len is None else int(seq_len)
 
         num_items = int(len(base_dataset))
         if num_items <= self.positive_offset:
@@ -94,6 +112,14 @@ class Stage1AdjacentPairDataset(Dataset):
     def __getitem__(self, idx: int):
         anchor_idx = int(self.anchor_indices[idx])
         positive_idx = int(self.positive_indices[idx])
-        anchor = _to_channel_first_tensor(_extract_window(self.base_dataset[anchor_idx]))
-        positive = _to_channel_first_tensor(_extract_window(self.base_dataset[positive_idx]))
+        anchor = _to_channel_first_tensor(
+            _extract_window(self.base_dataset[anchor_idx]),
+            in_channels=self.in_channels,
+            seq_len=self.seq_len,
+        )
+        positive = _to_channel_first_tensor(
+            _extract_window(self.base_dataset[positive_idx]),
+            in_channels=self.in_channels,
+            seq_len=self.seq_len,
+        )
         return anchor, positive

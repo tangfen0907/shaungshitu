@@ -9,7 +9,6 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from utils.clustering import _cluster_boundary_radii, _cluster_features, _nearest_other_clusters
-from utils.losses import prototype_separation_loss
 
 
 __all__ = [
@@ -25,6 +24,8 @@ __all__ = [
     "_set_stage2_train_phase",
     "_select_a_core",
     "_stage2_a_batch_loss",
+    "_stage2_a_collect_calibration_data",
+    "_stage2_a_ema_update_one_view",
     "_run_stage2_a_epoch",
     "_select_b_core",
     "_stage2_b_batch_loss",
@@ -65,6 +66,7 @@ def _zero_stage2_loss(self) -> torch.Tensor:
 
 
 def _collect_last_point_features(self, loader: DataLoader) -> Tuple[np.ndarray, np.ndarray]:
+    """Collect one current-point embedding per local L-window."""
     self._uses_separate_prototypes()
     was_training = self.model.training
     self.model.eval()
@@ -73,13 +75,13 @@ def _collect_last_point_features(self, loader: DataLoader) -> Tuple[np.ndarray, 
     with torch.inference_mode():
         for batch in loader:
             x = self._prepare_batch(batch)
-            outputs = self.model(x, stage="stage1")
-            features_v1.append(outputs["H1"][:, -1, :].detach().cpu().numpy())
-            features_v2.append(outputs["H2"][:, -1, :].detach().cpu().numpy())
+            z1, z2 = self.model.encode_views(x)
+            features_v1.append(z1.detach().cpu().numpy())
+            features_v2.append(z2.detach().cpu().numpy())
     if was_training:
         self.model.train()
     if not features_v1 or not features_v2:
-        raise RuntimeError("No last-point features were available for Stage2 initialization.")
+        raise RuntimeError("No local-window features were available for Stage2 initialization.")
     z1 = np.concatenate(features_v1, axis=0).astype(np.float32)
     z2 = np.concatenate(features_v2, axis=0).astype(np.float32)
     if z1.shape != z2.shape:
@@ -178,24 +180,26 @@ def _set_stage2_train_phase(self, phase: str):
     ]
 
     if phase_key == "A":
+        # Stage2-A is prototype refresh/calibration. It freezes encoders and
+        # updates P1/P2 explicitly from high-quality core means, not by a
+        # gradient loss or optimizer.step().
+        self.model.eval()
         for module in encoder_modules:
             module.requires_grad_(False)
             module.eval()
-        p1.requires_grad_(True)
-        p2.requires_grad_(True)
-        self.model.prototype_head_v1.train()
-        self.model.prototype_head_v2.train()
-        parameters = [p1, p2]
-    else:
-        for module in encoder_modules:
-            module.requires_grad_(True)
-            module.train()
         p1.requires_grad_(False)
         p2.requires_grad_(False)
-        parameters = []
-        for module in encoder_modules:
-            parameters.extend(list(module.parameters()))
+        self.optimizer = None
+        return
 
+    for module in encoder_modules:
+        module.requires_grad_(True)
+        module.train()
+    p1.requires_grad_(False)
+    p2.requires_grad_(False)
+    parameters = []
+    for module in encoder_modules:
+        parameters.extend(list(module.parameters()))
     self.optimizer = Adam(
         parameters,
         lr=float(getattr(self.config, "lr", 1e-3)),
@@ -209,14 +213,13 @@ def _select_a_core(
     prototypes: torch.Tensor,
     ratio: float,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compatibility helper: distance-only per-prototype core selection."""
     if z_flat.dim() != 2 or prototypes.dim() != 2:
         raise ValueError("A-core selection expects z_flat [N, D] and prototypes [K, D].")
     ratio = min(max(float(ratio), 0.0), 1.0)
     if ratio <= 0.0:
         return torch.zeros(z_flat.size(0), dtype=torch.bool, device=z_flat.device), torch.zeros(
-            z_flat.size(0),
-            dtype=torch.long,
-            device=z_flat.device,
+            z_flat.size(0), dtype=torch.long, device=z_flat.device
         )
 
     with torch.no_grad():
@@ -235,58 +238,126 @@ def _select_a_core(
 
 
 def _stage2_a_batch_loss(self, batch) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    x = self._prepare_batch(batch)
-    with torch.no_grad():
-        outputs = self.model(x, stage="stage1")
-        z1_all = outputs["H1"].reshape(-1, outputs["H1"].size(-1))
-        z2_all = outputs["H2"].reshape(-1, outputs["H2"].size(-1))
-
-    p1 = self.model.prototype_head_v1.prototypes
-    p2 = self.model.prototype_head_v2.prototypes
-    ratio = float(getattr(self.config, "core_ratio_A", 0.5))
-    core_v1, labels_v1 = self._select_a_core(z1_all, p1, ratio)
-    core_v2, labels_v2 = self._select_a_core(z2_all, p2, ratio)
-
-    if bool(core_v1.any()):
-        pull_v1 = torch.sum((z1_all.detach()[core_v1] - p1[labels_v1[core_v1]]) ** 2, dim=1).mean()
-    else:
-        pull_v1 = self._zero_stage2_loss()
-    if bool(core_v2.any()):
-        pull_v2 = torch.sum((z2_all.detach()[core_v2] - p2[labels_v2[core_v2]]) ** 2, dim=1).mean()
-    else:
-        pull_v2 = self._zero_stage2_loss()
-    loss_pull = 0.5 * (pull_v1 + pull_v2)
-
-    sep_v1 = prototype_separation_loss(
-        p1,
-        float(getattr(self.config, "proto_separation_margin", 1.0)),
-        force_weight=float(getattr(self.config, "proto_separation_force_weight", 0.1)),
-        eps=float(getattr(self.config, "robust_eps", 1e-6)),
+    raise RuntimeError(
+        "Stage2-A is now prototype refresh/calibration. It has no per-batch "
+        "gradient loss and does not call optimizer.step()."
     )
-    sep_v2 = prototype_separation_loss(
-        p2,
-        float(getattr(self.config, "proto_separation_margin", 1.0)),
-        force_weight=float(getattr(self.config, "proto_separation_force_weight", 0.1)),
-        eps=float(getattr(self.config, "robust_eps", 1e-6)),
-    )
-    loss_sep = 0.5 * (sep_v1 + sep_v2)
-    loss_pair = F.mse_loss(p1, p2)
 
-    loss = (
-        float(getattr(self.config, "lambda_pull_A", 1.0)) * loss_pull
-        + float(getattr(self.config, "lambda_sep_A", 0.1)) * loss_sep
-        + float(getattr(self.config, "lambda_pair_A", 0.1)) * loss_pair
-    )
-    return loss, {
-        "loss": loss,
-        "loss_pull": loss_pull,
-        "pull_v1": pull_v1,
-        "pull_v2": pull_v2,
-        "loss_sep": loss_sep,
-        "loss_pair": loss_pair,
-        "core_ratio_v1": core_v1.float().mean(),
-        "core_ratio_v2": core_v2.float().mean(),
+
+def _prototype_min_pairwise_distance(prototypes: torch.Tensor) -> float:
+    if prototypes.size(0) <= 1:
+        return 0.0
+    dist = torch.cdist(prototypes, prototypes, p=2.0)
+    dist.fill_diagonal_(float("inf"))
+    value = torch.min(dist).item()
+    return float(value) if np.isfinite(value) else 0.0
+
+
+def _format_float_list(values: np.ndarray, precision: int = 4) -> List[float]:
+    values = np.asarray(values, dtype=np.float32).reshape(-1)
+    return [round(float(v), int(precision)) for v in values.tolist()]
+
+
+def _stage2_a_collect_calibration_data(self, loader: DataLoader) -> Dict[str, torch.Tensor]:
+    collected: Dict[str, List[torch.Tensor]] = {
+        "h1": [],
+        "h2": [],
+        "pred1": [],
+        "pred2": [],
+        "score": [],
+        "dist_score": [],
+        "align_score": [],
+        "recon_score": [],
     }
+    alpha = float(getattr(self.config, "alpha_A", 1.0))
+    beta = float(getattr(self.config, "beta_A", 1.0))
+    gamma = float(getattr(self.config, "gamma_A", 0.5))
+
+    progress = tqdm(
+        loader,
+        desc="Stage2-A collect",
+        leave=False,
+        disable=not self._show_batch_progress(),
+    )
+    with torch.inference_mode():
+        for batch in progress:
+            x = self._prepare_batch(batch)
+            outputs = self.model(x, stage="stage2", detach_prototypes=True)
+            h1 = outputs["H1"]
+            h2 = outputs["H2"]
+            q1 = outputs["q1"]
+            q2 = outputs["q2"]
+            dist1_sq = outputs["proto_dist_matrix1"].min(dim=1).values
+            dist2_sq = outputs["proto_dist_matrix2"].min(dim=1).values
+            dist_score = 0.5 * (dist1_sq + dist2_sq)
+            align_score = torch.mean((q1 - q2) ** 2, dim=1)
+            if gamma != 0.0:
+                recon1 = self._mse_per_sample(x, outputs["x_hat1"], view="v1")
+                recon2 = self._mse_per_sample(x, outputs["x_hat2"], view="v2")
+                recon_score = 0.5 * (recon1 + recon2)
+            else:
+                recon_score = torch.zeros_like(dist_score)
+            score = alpha * dist_score + beta * align_score + gamma * recon_score
+
+            collected["h1"].append(h1.detach().cpu())
+            collected["h2"].append(h2.detach().cpu())
+            collected["pred1"].append(outputs["proto_pred1"].detach().cpu().long())
+            collected["pred2"].append(outputs["proto_pred2"].detach().cpu().long())
+            collected["score"].append(score.detach().cpu())
+            collected["dist_score"].append(dist_score.detach().cpu())
+            collected["align_score"].append(align_score.detach().cpu())
+            collected["recon_score"].append(recon_score.detach().cpu())
+
+    if not collected["h1"]:
+        raise RuntimeError("Stage2-A calibration found no training samples.")
+    return {key: torch.cat(value, dim=0) for key, value in collected.items()}
+
+
+def _stage2_a_ema_update_one_view(
+    self,
+    embeddings: torch.Tensor,
+    labels: torch.Tensor,
+    score: torch.Tensor,
+    prototypes: torch.Tensor,
+    *,
+    ratio: float,
+    min_core_per_proto: int,
+    momentum: float,
+    view_name: str,
+) -> Tuple[torch.Tensor, np.ndarray, np.ndarray, np.ndarray, List[int]]:
+    num_prototypes = int(prototypes.size(0))
+    updated = prototypes.clone()
+    core_counts = np.zeros(num_prototypes, dtype=np.int64)
+    mean_scores = np.full(num_prototypes, np.nan, dtype=np.float32)
+    update_norms = np.zeros(num_prototypes, dtype=np.float32)
+    skipped: List[int] = []
+    ratio = min(max(float(ratio), 0.0), 1.0)
+    min_core_per_proto = max(1, int(min_core_per_proto))
+
+    for proto_id in range(num_prototypes):
+        proto_indices = torch.nonzero(labels == proto_id, as_tuple=False).flatten()
+        count = int(proto_indices.numel())
+        if count < min_core_per_proto or ratio <= 0.0:
+            skipped.append(proto_id)
+            continue
+        keep_count = int(np.ceil(float(count) * ratio))
+        keep_count = max(min_core_per_proto, keep_count)
+        keep_count = min(keep_count, count)
+        order = torch.argsort(score[proto_indices], stable=True)
+        core_indices = proto_indices[order[:keep_count]]
+        core_mean = embeddings[core_indices].mean(dim=0)
+        new_value = float(momentum) * prototypes[proto_id] + (1.0 - float(momentum)) * core_mean
+        updated[proto_id] = new_value
+        core_counts[proto_id] = int(keep_count)
+        mean_scores[proto_id] = float(score[core_indices].mean().item())
+        update_norms[proto_id] = float(torch.norm(new_value - prototypes[proto_id], p=2).item())
+
+    if skipped:
+        print(
+            f"[Stage2-A][Warning] {view_name} skipped prototype(s) without enough core: "
+            f"{skipped} | min_core_per_proto={min_core_per_proto}"
+        )
+    return updated, core_counts, mean_scores, update_norms, skipped
 
 
 def _run_stage2_a_epoch(
@@ -299,80 +370,141 @@ def _run_stage2_a_epoch(
     total_epochs: int,
 ):
     self._set_stage2_train_phase("A")
-    totals = {
-        "loss": 0.0,
-        "loss_pull": 0.0,
-        "pull_v1": 0.0,
-        "pull_v2": 0.0,
-        "loss_sep": 0.0,
-        "loss_pair": 0.0,
-        "core_ratio_v1": 0.0,
-        "core_ratio_v2": 0.0,
-    }
-    progress = tqdm(
-        loader,
-        desc=f"Stage2-A R{round_idx} E{epoch_in_phase}",
-        leave=False,
-        disable=not self._show_batch_progress(),
+    data = self._stage2_a_collect_calibration_data(loader)
+
+    p1_old = self.model.prototype_head_v1.prototypes.detach().cpu()
+    p2_old = self.model.prototype_head_v2.prototypes.detach().cpu()
+    ratio = float(getattr(self.config, "core_ratio_A", 0.3))
+    min_core = int(getattr(self.config, "min_core_per_proto", 1))
+    momentum = float(getattr(self.config, "proto_momentum", 0.8))
+    momentum = min(max(momentum, 0.0), 0.999)
+    pair_strength = float(getattr(self.config, "pair_align_strength", 0.2))
+    pair_strength = min(max(pair_strength, 0.0), 1.0)
+
+    p1_new, core_count_v1, mean_score_v1, update_norm_v1, skipped_v1 = self._stage2_a_ema_update_one_view(
+        data["h1"],
+        data["pred1"],
+        data["score"],
+        p1_old,
+        ratio=ratio,
+        min_core_per_proto=min_core,
+        momentum=momentum,
+        view_name="View1",
     )
-    for batch in progress:
-        loss, metrics = self._stage2_a_batch_loss(batch)
-        self.optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        self.optimizer.step()
-        for key in totals:
-            totals[key] += float(metrics[key].item())
-        progress.set_postfix(
-            {
-                "loss": f"{loss.item():.4f}",
-                "pull": f"{metrics['loss_pull'].item():.4f}",
-                "sep": f"{metrics['loss_sep'].item():.4f}",
-                "pair": f"{metrics['loss_pair'].item():.4f}",
-            }
+    p2_new, core_count_v2, mean_score_v2, update_norm_v2, skipped_v2 = self._stage2_a_ema_update_one_view(
+        data["h2"],
+        data["pred2"],
+        data["score"],
+        p2_old,
+        ratio=ratio,
+        min_core_per_proto=min_core,
+        momentum=momentum,
+        view_name="View2",
+    )
+
+    # Semantic goal: P1[k] and P2[k] should represent the same normal operating
+    # mode. Implementation: use progressive pair alignment to avoid
+    # destabilizing early training when the two view spaces are not yet fully
+    # calibrated.
+    p_avg = 0.5 * (p1_new + p2_new)
+    p1_final = (1.0 - pair_strength) * p1_new + pair_strength * p_avg
+    p2_final = (1.0 - pair_strength) * p2_new + pair_strength * p_avg
+
+    with torch.no_grad():
+        self.model.prototype_head_v1.prototypes.copy_(
+            p1_final.to(device=self.model.prototype_head_v1.prototypes.device, dtype=self.model.prototype_head_v1.prototypes.dtype)
         )
-    denom = max(1, len(loader))
-    self._log_epoch(
-        "Stage2-A",
-        global_epoch,
-        total_epochs,
-        {key: value / denom for key, value in totals.items()},
+        self.model.prototype_head_v2.prototypes.copy_(
+            p2_final.to(device=self.model.prototype_head_v2.prototypes.device, dtype=self.model.prototype_head_v2.prototypes.dtype)
+        )
+
+    update_norm_final_v1 = torch.norm(p1_final - p1_old, dim=1).numpy().astype(np.float32)
+    update_norm_final_v2 = torch.norm(p2_final - p2_old, dim=1).numpy().astype(np.float32)
+    mean_score_by_proto = np.nanmean(np.stack([mean_score_v1, mean_score_v2], axis=0), axis=0)
+    finite_mean_score = mean_score_by_proto[np.isfinite(mean_score_by_proto)]
+
+    diagnostics = {
+        "samples": int(data["h1"].size(0)),
+        "core_ratio_v1": float(core_count_v1.sum() / max(1, int(data["h1"].size(0)))),
+        "core_ratio_v2": float(core_count_v2.sum() / max(1, int(data["h2"].size(0)))),
+        "prototype_min_dist_v1": _prototype_min_pairwise_distance(p1_final),
+        "prototype_min_dist_v2": _prototype_min_pairwise_distance(p2_final),
+        "pair_mse": float(F.mse_loss(p1_final, p2_final).item()),
+        "mean_core_score": float(np.mean(finite_mean_score)) if finite_mean_score.size else 0.0,
+        "prototype_update_norm": float(0.5 * (np.mean(update_norm_final_v1) + np.mean(update_norm_final_v2))),
+        "dist_score_mean": float(data["dist_score"].mean().item()),
+        "align_score_mean": float(data["align_score"].mean().item()),
+        "recon_score_mean": float(data["recon_score"].mean().item()),
+        "skipped_proto_v1": int(len(skipped_v1)),
+        "skipped_proto_v2": int(len(skipped_v2)),
+    }
+    self.stage2_a_last_diagnostics = {
+        **diagnostics,
+        "core_count_by_proto_v1": core_count_v1,
+        "core_count_by_proto_v2": core_count_v2,
+        "mean_core_score_by_proto": mean_score_by_proto,
+        "prototype_update_norm_v1": update_norm_final_v1,
+        "prototype_update_norm_v2": update_norm_final_v2,
+        "ema_update_norm_v1": update_norm_v1,
+        "ema_update_norm_v2": update_norm_v2,
+    }
+
+    print(
+        "[Stage2-A] prototype refresh/calibration | "
+        f"round={round_idx} | epoch_in_phase={epoch_in_phase} | "
+        f"proto_momentum={momentum:.3f} | pair_align_strength={pair_strength:.3f} | "
+        f"core_ratio_A={ratio:.3f} | min_core_per_proto={min_core}"
     )
+    print(
+        "[Stage2-A] diagnostics | "
+        f"prototype_min_dist_v1={diagnostics['prototype_min_dist_v1']:.6f} | "
+        f"prototype_min_dist_v2={diagnostics['prototype_min_dist_v2']:.6f} | "
+        f"pair_mse={diagnostics['pair_mse']:.6f} | "
+        f"prototype_update_norm={diagnostics['prototype_update_norm']:.6f}"
+    )
+    print(
+        "[Stage2-A] core_count_by_proto_v1="
+        f"{core_count_v1.astype(int).tolist()} | "
+        "core_count_by_proto_v2="
+        f"{core_count_v2.astype(int).tolist()}"
+    )
+    print(
+        "[Stage2-A] mean_core_score_by_proto="
+        f"{_format_float_list(np.nan_to_num(mean_score_by_proto, nan=0.0))} | "
+        "prototype_update_norm_v1="
+        f"{_format_float_list(update_norm_final_v1)} | "
+        "prototype_update_norm_v2="
+        f"{_format_float_list(update_norm_final_v2)}"
+    )
+
+    self._log_epoch("Stage2-A", global_epoch, total_epochs, diagnostics)
 
 
 def _select_b_core(self, outputs: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    q1_t = outputs["q1_time"][:, 1:, :]
-    q2_t = outputs["q2_time"][:, 1:, :]
-    q1_prev = outputs["q1_time"][:, :-1, :]
-    q2_prev = outputs["q2_time"][:, :-1, :]
+    q1 = outputs["q1"]
+    q2 = outputs["q2"]
     dist_score = 0.5 * (
-        outputs["proto_dist1_time"][:, 1:]
-        + outputs["proto_dist2_time"][:, 1:]
+        outputs["proto_dist_matrix1"].min(dim=1).values
+        + outputs["proto_dist_matrix2"].min(dim=1).values
     )
-    align = torch.mean((q1_t - q2_t) ** 2, dim=-1)
-    delta_align = torch.mean(((q1_t - q1_prev) - (q2_t - q2_prev)) ** 2, dim=-1)
+    align = torch.mean((q1 - q2) ** 2, dim=-1)
     score = (
         float(getattr(self.config, "alpha_B", 1.0)) * dist_score
         + float(getattr(self.config, "beta_B", 1.0)) * align
-        + float(getattr(self.config, "gamma_B", 1.0)) * delta_align
     )
 
     ratio = min(max(float(getattr(self.config, "core_ratio_B", 0.5)), 0.0), 1.0)
-    flat_score = score.reshape(-1)
-    core_count = 0 if ratio <= 0.0 else max(1, int(np.ceil(float(flat_score.numel()) * ratio)))
-    core_count = min(core_count, int(flat_score.numel()))
-    core_mask = torch.zeros_like(flat_score, dtype=torch.bool)
+    core_count = 0 if ratio <= 0.0 else max(1, int(np.ceil(float(score.numel()) * ratio)))
+    core_count = min(core_count, int(score.numel()))
+    core_mask = torch.zeros_like(score, dtype=torch.bool)
     if core_count > 0:
-        indices = torch.topk(flat_score.detach(), k=core_count, largest=False, sorted=False).indices
+        indices = torch.topk(score.detach(), k=core_count, largest=False, sorted=False).indices
         core_mask[indices] = True
-    core_mask = core_mask.reshape_as(score)
     return core_mask, {
-        "q1_t": q1_t,
-        "q2_t": q2_t,
-        "q1_prev": q1_prev,
-        "q2_prev": q2_prev,
+        "q1": q1,
+        "q2": q2,
         "dist_score": dist_score,
         "align": align,
-        "delta_align": delta_align,
         "score": score,
     }
 
@@ -384,37 +516,33 @@ def _stage2_b_batch_loss(self, batch) -> Tuple[torch.Tensor, Dict[str, torch.Ten
     loss_rec = 0.5 * (rec_v1 + rec_v2)
 
     core_mask, cached = self._select_b_core(outputs)
-    q1_t = cached["q1_t"]
-    q2_t = cached["q2_t"]
-    q1_prev = cached["q1_prev"]
-    q2_prev = cached["q2_prev"]
+    q1 = cached["q1"]
+    q2 = cached["q2"]
     align = cached["align"]
-    delta_align = cached["delta_align"]
-    q_avg = 0.5 * (q1_t + q2_t)
+    q_avg = 0.5 * (q1 + q2)
     core_labels = torch.argmax(q_avg, dim=-1)
-    h1_t = outputs["H1"][:, 1:, :]
-    h2_t = outputs["H2"][:, 1:, :]
+    h1 = outputs["H1"]
+    h2 = outputs["H2"]
     p1 = self.model.prototype_head_v1.prototypes
     p2 = self.model.prototype_head_v2.prototypes
 
     if bool(core_mask.any()):
         selected_labels = core_labels[core_mask]
-        pull_v1 = torch.sum((h1_t[core_mask] - p1.detach()[selected_labels]) ** 2, dim=1).mean()
-        pull_v2 = torch.sum((h2_t[core_mask] - p2.detach()[selected_labels]) ** 2, dim=1).mean()
+        pull_v1 = torch.sum((h1[core_mask] - p1.detach()[selected_labels]) ** 2, dim=1).mean()
+        pull_v2 = torch.sum((h2[core_mask] - p2.detach()[selected_labels]) ** 2, dim=1).mean()
         loss_pull = 0.5 * (pull_v1 + pull_v2)
-        loss_align = align[core_mask].mean()
-        loss_delta = delta_align[core_mask].mean()
     else:
         pull_v1 = self._zero_stage2_loss()
         pull_v2 = self._zero_stage2_loss()
         loss_pull = self._zero_stage2_loss()
-        loss_align = self._zero_stage2_loss()
-        loss_delta = self._zero_stage2_loss()
+
+    loss_align = align.mean()
+    loss_delta = self._zero_stage2_loss()
 
     x_negative = self._inject_last_context(x, stage="stage2")
     outputs_negative = self.model(x_negative, stage="stage2", detach_prototypes=True)
-    z1_negative = outputs_negative["H1"][:, -1, :]
-    z2_negative = outputs_negative["H2"][:, -1, :]
+    z1_negative = outputs_negative["H1"]
+    z2_negative = outputs_negative["H2"]
     min_dist1_negative = torch.cdist(z1_negative, p1.detach(), p=2.0).pow(2).min(dim=1).values
     min_dist2_negative = torch.cdist(z2_negative, p2.detach(), p=2.0).pow(2).min(dim=1).values
     margin = float(getattr(self.config, "margin_anom", 1.0))
@@ -426,7 +554,6 @@ def _stage2_b_batch_loss(self, batch) -> Tuple[torch.Tensor, Dict[str, torch.Ten
         float(getattr(self.config, "lambda_rec_B", 1.0)) * loss_rec
         + float(getattr(self.config, "lambda_pull_B", 0.5)) * loss_pull
         + float(getattr(self.config, "lambda_align_B", 0.05)) * loss_align
-        + float(getattr(self.config, "lambda_delta_B", 0.05)) * loss_delta
         + float(getattr(self.config, "lambda_anom_B", 0.05)) * loss_anom
     )
     return loss, {
@@ -445,7 +572,7 @@ def _stage2_b_batch_loss(self, batch) -> Tuple[torch.Tensor, Dict[str, torch.Ten
         "core_ratio": core_mask.float().mean(),
         "score_mean": cached["score"].mean(),
         "align_mean": align.mean(),
-        "delta_mean": delta_align.mean(),
+        "delta_mean": loss_delta,
     }
 
 
@@ -497,7 +624,6 @@ def _run_stage2_b_epoch(
                 "rec": f"{metrics['loss_rec'].item():.4f}",
                 "pull": f"{metrics['loss_pull'].item():.4f}",
                 "align": f"{metrics['loss_align'].item():.4f}",
-                "delta": f"{metrics['loss_delta'].item():.4f}",
                 "anom": f"{metrics['loss_anom'].item():.4f}",
             }
         )
@@ -515,8 +641,8 @@ def _refresh_aligned_stage2_state(self, round_idx: int):
     was_training = self.model.training
     self.model.eval()
     collected: Dict[str, List[np.ndarray]] = {
-        "h1_last": [],
-        "h2_last": [],
+        "h1": [],
+        "h2": [],
         "q1": [],
         "q2": [],
         "pred1": [],
@@ -532,20 +658,16 @@ def _refresh_aligned_stage2_state(self, round_idx: int):
         for batch in self.train_eval_loader:
             x = self._prepare_batch(batch)
             outputs = self.model(x, stage="stage2")
-            q1_last = outputs["q1_time"][:, -1, :]
-            q2_last = outputs["q2_time"][:, -1, :]
-            conf1_last, pred1_last = torch.max(q1_last, dim=1)
-            conf2_last, pred2_last = torch.max(q2_last, dim=1)
-            collected["h1_last"].append(outputs["H1"][:, -1, :].detach().cpu().numpy())
-            collected["h2_last"].append(outputs["H2"][:, -1, :].detach().cpu().numpy())
-            collected["q1"].append(q1_last.detach().cpu().numpy())
-            collected["q2"].append(q2_last.detach().cpu().numpy())
-            collected["pred1"].append(pred1_last.detach().cpu().numpy())
-            collected["pred2"].append(pred2_last.detach().cpu().numpy())
-            collected["conf1"].append(conf1_last.detach().cpu().numpy())
-            collected["conf2"].append(conf2_last.detach().cpu().numpy())
-            collected["dist1"].append(outputs["proto_dist1_time"][:, -1].detach().cpu().numpy())
-            collected["dist2"].append(outputs["proto_dist2_time"][:, -1].detach().cpu().numpy())
+            collected["h1"].append(outputs["H1"].detach().cpu().numpy())
+            collected["h2"].append(outputs["H2"].detach().cpu().numpy())
+            collected["q1"].append(outputs["q1"].detach().cpu().numpy())
+            collected["q2"].append(outputs["q2"].detach().cpu().numpy())
+            collected["pred1"].append(outputs["proto_pred1"].detach().cpu().numpy())
+            collected["pred2"].append(outputs["proto_pred2"].detach().cpu().numpy())
+            collected["conf1"].append(outputs["proto_conf1"].detach().cpu().numpy())
+            collected["conf2"].append(outputs["proto_conf2"].detach().cpu().numpy())
+            collected["dist1"].append(outputs["proto_dist1"].detach().cpu().numpy())
+            collected["dist2"].append(outputs["proto_dist2"].detach().cpu().numpy())
             collected["recon1"].append(self._mse_per_sample(x, outputs["x_hat1"], view="v1").detach().cpu().numpy())
             collected["recon2"].append(self._mse_per_sample(x, outputs["x_hat2"], view="v2").detach().cpu().numpy())
     if was_training:
@@ -557,10 +679,7 @@ def _refresh_aligned_stage2_state(self, round_idx: int):
     centers = (0.5 * (centers_v1 + centers_v2)).astype(np.float32)
     q_avg = 0.5 * (arrays["q1"] + arrays["q2"])
     labels = np.argmax(q_avg, axis=1).astype(np.int64)
-    avg_features = 0.5 * (
-        arrays["h1_last"].astype(np.float32)
-        + arrays["h2_last"].astype(np.float32)
-    )
+    avg_features = 0.5 * (arrays["h1"].astype(np.float32) + arrays["h2"].astype(np.float32))
     core_mask = np.ones(labels.shape[0], dtype=bool)
     score_core = (0.5 * (arrays["dist1"] + arrays["dist2"])).astype(np.float32)
     radii = _cluster_boundary_radii(
@@ -590,7 +709,7 @@ def _refresh_aligned_stage2_state(self, round_idx: int):
         "nearest_other_cluster": nearest_other,
         "score_core": score_core,
         "refresh_round": int(round_idx),
-        "bank_mode": "stage2_ab_aligned",
+        "bank_mode": "stage2_ab_aligned_local_window",
         "bank_summary": summary,
         "proto_conf1": arrays["conf1"].astype(np.float32),
         "proto_conf2": arrays["conf2"].astype(np.float32),

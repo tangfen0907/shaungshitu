@@ -14,9 +14,12 @@ from model.tcn_encoder import TCNEncoder
 class AnomalyDetector(nn.Module):
     """Top-level anomaly detector.
 
-    Dual-view mode uses point-level View1/View2 encodings and independent
-    reconstruction heads. The compatibility global z remains for the existing
-    training/evaluation flow.
+    Dual-view mode now uses local-window View1/View2 encodings:
+
+        X_t: [B, M, L] -> H1_t/H2_t: [B, d_model]
+
+    A length-L window is one sample for the current point t. There is no
+    point-level [B, T, d] sequence output in the dual-view route.
     """
 
     def __init__(
@@ -75,7 +78,7 @@ class AnomalyDetector(nn.Module):
             self.dual_encoder = PointwiseDualEncoder(
                 in_channels=self.raw_in_channels,
                 d_model=latent_dim,
-                history_len=self.dual_history_len,
+                history_len=self.raw_seq_len,
                 current_out=self.dual_current_out,
                 short_out=self.dual_short_out,
                 long_out=self.dual_long_out,
@@ -87,14 +90,16 @@ class AnomalyDetector(nn.Module):
             self.reconstructor_v1 = Reconstructor(
                 latent_dim=latent_dim,
                 out_channels=self.raw_in_channels,
+                output_len=1,
                 hidden_dim=max(128, latent_dim * 2),
             )
             self.reconstructor_v2 = Reconstructor(
                 latent_dim=latent_dim,
                 out_channels=self.raw_in_channels,
+                output_len=1,
                 hidden_dim=max(128, latent_dim * 2),
             )
-            self._time_proto_shape_logged = False
+            self._sample_proto_shape_logged = False
         elif self.active_view == "v1":
             encoder_in_channels = self.raw_in_channels
             self.encoder_seq_len = self.raw_seq_len
@@ -288,7 +293,7 @@ class AnomalyDetector(nn.Module):
             z = self.encode(x)
             return z, z
         features = self.dual_encoder(x)
-        return features["H1"][:, -1, :], features["H2"][:, -1, :]
+        return features["H1"], features["H2"]
 
     def project_state(self, z: torch.Tensor, view: str = None) -> torch.Tensor:
         if not self.is_dual_view:
@@ -360,35 +365,17 @@ class AnomalyDetector(nn.Module):
             return self.reconstructor_v2(z)
         raise ValueError("view should be 'v1' or 'v2'.")
 
-    def _time_topk_mean(self, time_dist: torch.Tensor) -> torch.Tensor:
-        if time_dist.dim() < 2:
-            return time_dist.reshape(time_dist.size(0), -1).mean(dim=1)
-        flat = time_dist.reshape(time_dist.size(0), -1)
-        time_count = int(flat.size(1))
-        if time_count <= 0:
-            return flat.mean(dim=1)
-        if self.topk_k > 0:
-            k = max(1, min(int(self.topk_k), time_count))
-        else:
-            ratio = self.topk_ratio if self.topk_ratio > 0 else 1.0
-            k = max(1, min(time_count, int(np.ceil(float(time_count) * float(ratio)))))
-        if k >= time_count:
-            return flat.mean(dim=1)
-        return torch.topk(flat, k=k, dim=1, largest=True, sorted=False).values.mean(dim=1)
-
     def forward(self, x: torch.Tensor, stage: str = "stage1", detach_prototypes: bool = False):
         """Return reconstruction and optional prototype outputs for the requested stage."""
         if self.is_dual_view:
             dual_features = self.dual_encoder(x)
             H1 = dual_features["H1"]
             H2 = dual_features["H2"]
-            z1 = H1[:, -1, :]
-            z2 = H2[:, -1, :]
+            z1 = H1
+            z2 = H2
             z = self._combine_dual_features(z1, z2)
-            x_hat1_time = self.reconstructor_v1(H1)
-            x_hat2_time = self.reconstructor_v2(H2)
-            x_hat1 = x_hat1_time.transpose(1, 2).contiguous()
-            x_hat2 = x_hat2_time.transpose(1, 2).contiguous()
+            x_hat1 = self.reconstructor_v1(z1)
+            x_hat2 = self.reconstructor_v2(z2)
             x_hat = 0.5 * (x_hat1 + x_hat2)
         else:
             z = self.encode(x)
@@ -415,55 +402,39 @@ class AnomalyDetector(nn.Module):
 
         if stage in {"stage2", "test", "separate_proto"}:
             if self.is_dual_view:
-                u1_time = H1
-                u2_time = H2
-                proto1 = self.prototype_head_v1(u1_time, detach_prototypes=detach_prototypes)
-                proto2 = self.prototype_head_v2(u2_time, detach_prototypes=detach_prototypes)
-                q1 = proto1["q"].mean(dim=1)
-                q2 = proto2["q"].mean(dim=1)
+                u1 = H1
+                u2 = H2
+                proto1 = self.prototype_head_v1(u1, detach_prototypes=detach_prototypes)
+                proto2 = self.prototype_head_v2(u2, detach_prototypes=detach_prototypes)
+                q1 = proto1["q"]
+                q2 = proto2["q"]
                 proto_conf1, proto_pred1 = torch.max(q1, dim=-1)
                 proto_conf2, proto_pred2 = torch.max(q2, dim=-1)
-                proto_dist1 = self._time_topk_mean(proto1["min_dist"])
-                proto_dist2 = self._time_topk_mean(proto2["min_dist"])
-                u1 = u1_time.mean(dim=1)
-                u2 = u2_time.mean(dim=1)
-                if not self._time_proto_shape_logged:
+                proto_dist1 = proto1["min_dist"]
+                proto_dist2 = proto2["min_dist"]
+                if not self._sample_proto_shape_logged:
                     print(
-                        "[Stage2-TimeProto] forward shapes | "
+                        "[Stage2-SampleProto] forward shapes | "
                         f"H1={tuple(H1.shape)} | "
-                        f"u1_time={tuple(u1_time.shape)} | "
-                        f"q1_time={tuple(proto1['q'].shape)} | "
-                        f"proto_dist1_time={tuple(proto1['min_dist'].shape)} | "
+                        f"u1={tuple(u1.shape)} | "
                         f"q1={tuple(q1.shape)} | "
                         f"proto_dist1={tuple(proto_dist1.shape)}"
                     )
-                    self._time_proto_shape_logged = True
+                    self._sample_proto_shape_logged = True
                 outputs.update(
                     {
                         "u1": u1,
                         "u2": u2,
-                        "u1_time": u1_time,
-                        "u2_time": u2_time,
                         "q1": q1,
                         "q2": q2,
-                        "q1_time": proto1["q"],
-                        "q2_time": proto2["q"],
-                        "proto_dist_matrix1": proto1["dist_sq"].mean(dim=1),
-                        "proto_dist_matrix2": proto2["dist_sq"].mean(dim=1),
-                        "proto_dist_matrix1_time": proto1["dist_sq"],
-                        "proto_dist_matrix2_time": proto2["dist_sq"],
+                        "proto_dist_matrix1": proto1["dist_sq"],
+                        "proto_dist_matrix2": proto2["dist_sq"],
                         "proto_dist1": proto_dist1,
                         "proto_dist2": proto_dist2,
-                        "proto_dist1_time": proto1["min_dist"],
-                        "proto_dist2_time": proto2["min_dist"],
                         "proto_pred1": proto_pred1,
                         "proto_pred2": proto_pred2,
-                        "proto_pred1_time": proto1["pred"],
-                        "proto_pred2_time": proto2["pred"],
                         "proto_conf1": proto_conf1,
                         "proto_conf2": proto_conf2,
-                        "proto_conf1_time": proto1["conf"],
-                        "proto_conf2_time": proto2["conf"],
                     }
                 )
             else:

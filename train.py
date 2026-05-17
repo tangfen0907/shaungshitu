@@ -155,6 +155,7 @@ TRAIN_OVERRIDE_KEYS = [
     "num_workers",
     "device",
     "cache_windows",
+    "left_pad_windows",
     "pin_memory",
     "enable_tf32",
     "cudnn_benchmark",
@@ -162,14 +163,21 @@ TRAIN_OVERRIDE_KEYS = [
     "stage1_positive_offset",
     "stage1_positive_direction",
     "stage1_inject_context_len",
-    "lambda_away_stage1",
-    "margin_stage1",
+    "lambda_stage1_triplet",
+    "lambda_cv_stage1",
+    "stage1_triplet_margin",
     "num_stage2_rounds",
     "epochs_per_stage2_round",
     "stage2_a_epochs",
     "stage2_b_epochs",
     "stage2_inject_context_len",
     "core_ratio_A",
+    "alpha_A",
+    "beta_A",
+    "gamma_A",
+    "proto_momentum",
+    "pair_align_strength",
+    "min_core_per_proto",
     "lambda_pull_A",
     "lambda_sep_A",
     "lambda_pair_A",
@@ -293,6 +301,7 @@ def build_parser(
     parser.add_argument("--num_workers", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--cache_windows", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--left_pad_windows", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--pin_memory", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--enable_tf32", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--cudnn_benchmark", action=argparse.BooleanOptionalAction, default=None)
@@ -301,8 +310,9 @@ def build_parser(
     parser.add_argument("--stage1_positive_offset", type=int, default=None)
     parser.add_argument("--stage1_positive_direction", type=str, default=None)
     parser.add_argument("--stage1_inject_context_len", type=int, default=None)
-    parser.add_argument("--lambda_away_stage1", type=float, default=None)
-    parser.add_argument("--margin_stage1", type=float, default=None)
+    parser.add_argument("--lambda_stage1_triplet", type=float, default=None)
+    parser.add_argument("--lambda_cv_stage1", type=float, default=None)
+    parser.add_argument("--stage1_triplet_margin", type=float, default=None)
 
     parser.add_argument("--num_stage2_rounds", type=int, default=None)
     parser.add_argument("--epochs_per_stage2_round", type=int, default=None)
@@ -310,6 +320,12 @@ def build_parser(
     parser.add_argument("--stage2_b_epochs", type=int, default=None)
     parser.add_argument("--stage2_inject_context_len", type=int, default=None)
     parser.add_argument("--core_ratio_A", type=float, default=None)
+    parser.add_argument("--alpha_A", type=float, default=None)
+    parser.add_argument("--beta_A", type=float, default=None)
+    parser.add_argument("--gamma_A", type=float, default=None)
+    parser.add_argument("--proto_momentum", type=float, default=None)
+    parser.add_argument("--pair_align_strength", type=float, default=None)
+    parser.add_argument("--min_core_per_proto", type=int, default=None)
     parser.add_argument("--lambda_pull_A", type=float, default=None)
     parser.add_argument("--lambda_sep_A", type=float, default=None)
     parser.add_argument("--lambda_pair_A", type=float, default=None)

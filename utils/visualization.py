@@ -3,9 +3,10 @@ from typing import Dict, List, Optional, Tuple
 import os
 
 import numpy as np
+from torch.utils.data import DataLoader
 
 from utils.scoring import compute_separate_proto_anomaly_score
-__all__ = ['_subsample_indices', '_build_train_window_anomaly_counts_for_visualization', '_build_train_window_anomaly_flags_for_visualization', '_has_valid_window_labels', '_project_visual_features_nd', '_visual_sample_indices', '_visual_state_array', '_reference_arrays_from_state', '_mask_from_state', '_labels_from_state', '_cluster_display_id', '_save_train_3d_visualization', '_save_dual_truth_visualizations', '_save_train_test_score_3d_visualization', '_save_stage2_component_score_visualizations']
+__all__ = ['_subsample_indices', '_build_train_window_anomaly_counts_for_visualization', '_build_train_window_anomaly_flags_for_visualization', '_has_valid_window_labels', '_dataset_visual_point_labels', '_dataset_visual_window_indices', '_collect_point_visualization_matrix', '_project_visual_features_nd', '_visual_sample_indices', '_visual_state_array', '_reference_arrays_from_state', '_mask_from_state', '_labels_from_state', '_cluster_display_id', '_build_full_train_visual_loader', '_train_visual_active_mask', '_filtered_trace_buttons', '_save_train_3d_visualization', '_save_point_truth_3d_visualization', '_save_dual_truth_visualizations', '_save_train_test_score_3d_visualization', '_save_stage2_component_score_visualizations']
 
 
 @staticmethod
@@ -26,7 +27,7 @@ def _dataset_chain_attr(dataset, name: str, default=None):
             value = getattr(current, name)
             if value is not None:
                 return value
-        current = getattr(current, "base_dataset", None)
+        current = getattr(current, "base_dataset", getattr(current, "dataset", None))
     return default
 
 
@@ -81,6 +82,151 @@ def _build_train_window_anomaly_flags_for_visualization(self, dataset) -> np.nda
         flags[idx] = int(np.any(label_array[start:end] > 0))
     return flags
 
+
+def _dataset_visual_point_labels(self, dataset) -> np.ndarray:
+    """Return one truth label per original timeline point."""
+    dataset_mode = str(_dataset_chain_attr(dataset, "mode", "train")).strip().lower()
+    if dataset_mode == "train":
+        labels = _dataset_chain_attr(dataset, "train_labels", None)
+        data = _dataset_chain_attr(dataset, "train", None)
+    else:
+        labels = _dataset_chain_attr(dataset, "test_labels", None)
+        data = _dataset_chain_attr(dataset, "test", None)
+
+    if labels is not None:
+        return np.asarray(labels, dtype=np.float32).reshape(-1).astype(np.int64)
+    if data is not None:
+        return np.zeros(int(np.asarray(data).shape[0]), dtype=np.int64)
+
+    win_size = int(_dataset_chain_attr(dataset, "win_size", self.config.seq_len))
+    step = int(_dataset_chain_attr(dataset, "step", 1))
+    total_points = max(0, (int(len(dataset)) - 1) * step + win_size)
+    return np.zeros(total_points, dtype=np.int64)
+
+
+def _dataset_visual_window_indices(dataset) -> np.ndarray:
+    """
+    Return original dense-window indices in the order yielded by `dataset`.
+
+    This keeps point aggregation correct when visualization runs over an
+    active-pool dataset view rather than the original dense dataset.
+    """
+    if hasattr(dataset, "original_indices"):
+        return np.asarray(getattr(dataset, "original_indices"), dtype=np.int64).reshape(-1)
+    if hasattr(dataset, "indices"):
+        return np.asarray(getattr(dataset, "indices"), dtype=np.int64).reshape(-1)
+    return np.arange(len(dataset), dtype=np.int64)
+
+
+def _build_full_train_visual_loader(self) -> DataLoader:
+    dataset = getattr(self, "full_train_dataset", self.train_eval_loader.dataset)
+    return DataLoader(
+        dataset=dataset,
+        batch_size=self.config.batch_size,
+        shuffle=False,
+        num_workers=self._effective_num_workers(),
+        drop_last=False,
+        pin_memory=self._pin_memory(),
+    )
+
+
+def _train_visual_active_mask(self, num_items: int) -> np.ndarray:
+    mask = np.asarray(
+        self._current_active_train_mask()
+        if hasattr(self, "_current_active_train_mask")
+        else np.ones(int(num_items), dtype=bool),
+        dtype=bool,
+    ).reshape(-1)
+    if mask.shape[0] != int(num_items):
+        return np.ones(int(num_items), dtype=bool)
+    return mask
+
+
+def _filtered_trace_buttons(self, trace_roles: List[str]) -> List[Dict[str, object]]:
+    if "filtered_train" not in trace_roles:
+        return []
+    show_all = [True] * len(trace_roles)
+    hide_filtered = [role != "filtered_train" for role in trace_roles]
+    return [
+        dict(
+            type="buttons",
+            direction="left",
+            x=0.0,
+            y=1.12,
+            xanchor="left",
+            yanchor="top",
+            buttons=[
+                dict(label="Show Filtered Train", method="update", args=[{"visible": show_all}]),
+                dict(label="Hide Filtered Train", method="update", args=[{"visible": hide_filtered}]),
+            ],
+        )
+    ]
+
+
+def _collect_point_visualization_matrix(self, loader, feature_view: str = None):
+    """
+    Return one feature per local L-window/current point.
+
+    The new dual encoder emits H_t: [B, d] for the current point only. We do
+    not aggregate H[t] over overlapping T=100 windows anymore; each window's
+    visualization label is the last label in that sample's label window.
+    """
+    if not self._is_dual_view_model():
+        raise RuntimeError("Current-point visualization requires the dual-view encoder.")
+
+    import torch
+
+    dataset = loader.dataset
+    view_key = str(feature_view or "v1").strip().lower()
+    view_key = "v2" if view_key in {"v2", "view2", "z2"} else "v1"
+    window_indices = _dataset_visual_window_indices(dataset)
+    step = int(_dataset_chain_attr(dataset, "step", 1))
+    win_size = int(_dataset_chain_attr(dataset, "win_size", getattr(self.config, "seq_len", 1)))
+    current_point_offset = int(_dataset_chain_attr(dataset, "current_point_offset", max(0, win_size - 1)))
+    label_source = self._dataset_visual_point_labels(dataset)
+
+    features = []
+    labels = []
+    point_indices_all = []
+    cursor = 0
+    was_training = self.model.training
+    self.model.eval()
+    with torch.inference_mode():
+        for batch in loader:
+            x = self._prepare_batch(batch)
+            encoded = self.model.dual_encoder(x)
+            h = encoded["H2"] if view_key == "v2" else encoded["H1"]
+            h_np = h.detach().cpu().numpy().astype(np.float32)
+            batch_size = int(h_np.shape[0])
+            batch_window_indices = window_indices[cursor:cursor + batch_size]
+            point_indices = batch_window_indices.astype(np.int64) * int(step) + current_point_offset
+
+            if isinstance(batch, (tuple, list)) and len(batch) >= 2:
+                labels_raw = batch[1]
+                if isinstance(labels_raw, torch.Tensor):
+                    labels_np = labels_raw.detach().cpu().numpy()
+                else:
+                    labels_np = np.asarray(labels_raw)
+                labels_np = labels_np.reshape(batch_size, -1)
+                point_labels = (labels_np[:, -1] > 0).astype(np.int64)
+            else:
+                safe_indices = np.clip(point_indices, 0, max(0, label_source.shape[0] - 1))
+                point_labels = label_source[safe_indices].astype(np.int64)
+
+            features.append(h_np)
+            labels.append(point_labels)
+            point_indices_all.append(point_indices.astype(np.int64))
+            cursor += batch_size
+    if was_training:
+        self.model.train()
+
+    if not features:
+        raise RuntimeError("Current-point visualization found no encoded windows.")
+    return (
+        np.concatenate(features, axis=0).astype(np.float32),
+        np.concatenate(labels, axis=0).astype(np.int64),
+        np.concatenate(point_indices_all, axis=0).astype(np.int64),
+    )
 
 def _has_valid_window_labels(self, dataset) -> bool:
     for idx in range(len(dataset)):
@@ -338,12 +484,14 @@ def _save_train_3d_visualization(
     rng = np.random.default_rng(int(self.config.seed) + {"stage0": 11, "stage1": 12, "stage2": 13}.get(str(stage_key), 19))
     max_points = int(getattr(self.config, "visualization_max_points", 3000))
 
-    train_features = self._collect_feature_matrix(self.train_eval_loader, view=feature_view)
+    train_visual_loader = self._build_full_train_visual_loader()
+    train_features = self._collect_feature_matrix(train_visual_loader, view=feature_view)
     test_features = self._collect_feature_matrix(self.test_loader, view=feature_view)
-    train_flags_all = self._build_train_window_anomaly_flags_for_visualization(self.train_eval_loader.dataset)
+    train_flags_all = self._build_train_window_anomaly_flags_for_visualization(train_visual_loader.dataset)
     test_flags_all = self._build_window_anomaly_flags(self.test_loader.dataset)
-    train_counts_all = self._build_train_window_anomaly_counts_for_visualization(self.train_eval_loader.dataset)
+    train_counts_all = self._build_train_window_anomaly_counts_for_visualization(train_visual_loader.dataset)
     test_counts_all = self._build_window_anomaly_counts(self.test_loader.dataset)
+    train_active_all = self._train_visual_active_mask(train_features.shape[0])
     train_idx = self._visual_sample_indices(train_flags_all, max_points, rng)
     test_idx = self._visual_sample_indices(test_flags_all, max_points, rng)
     train_sel = train_features[train_idx]
@@ -393,6 +541,7 @@ def _save_train_3d_visualization(
     cluster_labels_all = self._labels_from_state(state, train_features.shape[0]) if include_structure else np.full(train_features.shape[0], -1, dtype=np.int64)
     sampled_true = train_flags_all[train_idx]
     sampled_counts = train_counts_all[train_idx]
+    sampled_active = train_active_all[train_idx]
     sampled_test_true = test_flags_all[test_idx]
     sampled_test_counts = test_counts_all[test_idx]
     sampled_core = core_mask_all[train_idx]
@@ -444,6 +593,7 @@ def _save_train_3d_visualization(
         return rows
 
     fig = go.Figure()
+    trace_roles: List[str] = []
 
     def _add_trace(
         coords_source: np.ndarray,
@@ -455,6 +605,7 @@ def _save_train_3d_visualization(
         opacity: float,
         hover_text: List[str],
         line_width: float = 0.0,
+        trace_role: str = "other",
     ):
         mask = np.asarray(mask, dtype=bool).reshape(-1)
         if not np.any(mask):
@@ -473,6 +624,7 @@ def _save_train_3d_visualization(
                 marker=dict(size=size, color=color, symbol=symbol, opacity=opacity, line=dict(width=line_width, color=color)),
             )
         )
+        trace_roles.append(trace_role)
 
     def _trace_hover(
         name: str,
@@ -499,23 +651,49 @@ def _save_train_3d_visualization(
 
     _add_trace(
         train_coords,
-        sampled_true == 0,
-        "Train True Normal",
+        (sampled_true == 0) & sampled_active,
+        "Train Active True Normal",
         "#16a34a",
         "circle",
         3,
         0.26,
-        _trace_hover("Train True Normal", "train", sampled_true == 0, train_idx, sampled_true, sampled_counts, train_pred_flags, train_center_scores, sampled_clusters),
+        _trace_hover("Train Active True Normal", "train", (sampled_true == 0) & sampled_active, train_idx, sampled_true, sampled_counts, train_pred_flags, train_center_scores, sampled_clusters),
+        trace_role="active_train",
     )
     _add_trace(
         train_coords,
-        sampled_true != 0,
-        "Train True Anomaly",
+        (sampled_true != 0) & sampled_active,
+        "Train Active True Anomaly",
         "#dc2626",
         "circle",
         5,
         0.62,
-        _trace_hover("Train True Anomaly", "train", sampled_true != 0, train_idx, sampled_true, sampled_counts, train_pred_flags, train_center_scores, sampled_clusters),
+        _trace_hover("Train Active True Anomaly", "train", (sampled_true != 0) & sampled_active, train_idx, sampled_true, sampled_counts, train_pred_flags, train_center_scores, sampled_clusters),
+        trace_role="active_train",
+    )
+    _add_trace(
+        train_coords,
+        (sampled_true == 0) & ~sampled_active,
+        "Train Filtered True Normal",
+        "#94a3b8",
+        "circle-open",
+        5,
+        0.52,
+        _trace_hover("Train Filtered True Normal", "train", (sampled_true == 0) & ~sampled_active, train_idx, sampled_true, sampled_counts, train_pred_flags, train_center_scores, sampled_clusters),
+        line_width=1.2,
+        trace_role="filtered_train",
+    )
+    _add_trace(
+        train_coords,
+        (sampled_true != 0) & ~sampled_active,
+        "Train Filtered True Anomaly",
+        "#f97316",
+        "circle-open",
+        6,
+        0.82,
+        _trace_hover("Train Filtered True Anomaly", "train", (sampled_true != 0) & ~sampled_active, train_idx, sampled_true, sampled_counts, train_pred_flags, train_center_scores, sampled_clusters),
+        line_width=1.2,
+        trace_role="filtered_train",
     )
     _add_trace(
         test_coords,
@@ -526,6 +704,7 @@ def _save_train_3d_visualization(
         3,
         0.34,
         _trace_hover("Test True Normal", "test", sampled_test_true == 0, test_idx, sampled_test_true, sampled_test_counts, test_pred_flags, test_center_scores),
+        trace_role="test",
     )
     _add_trace(
         test_coords,
@@ -536,6 +715,7 @@ def _save_train_3d_visualization(
         5,
         0.74,
         _trace_hover("Test True Anomaly", "test", sampled_test_true != 0, test_idx, sampled_test_true, sampled_test_counts, test_pred_flags, test_center_scores),
+        trace_role="test",
     )
     if include_structure:
         _add_trace(
@@ -548,6 +728,7 @@ def _save_train_3d_visualization(
             0.95,
             _trace_hover("Train Core", "train", sampled_core, train_idx, sampled_true, sampled_counts, train_pred_flags, train_center_scores, sampled_clusters),
             line_width=1.2,
+            trace_role="active_train",
         )
     if include_prediction:
         _add_trace(
@@ -560,6 +741,7 @@ def _save_train_3d_visualization(
             0.56,
             _trace_hover("Train Pred Normal (center)", "train", train_pred_flags == 0, train_idx, sampled_true, sampled_counts, train_pred_flags, train_center_scores, sampled_clusters),
             line_width=1.1,
+            trace_role="active_train",
         )
         _add_trace(
             train_coords,
@@ -571,6 +753,7 @@ def _save_train_3d_visualization(
             0.88,
             _trace_hover("Train Pred Anomaly (center)", "train", train_pred_flags != 0, train_idx, sampled_true, sampled_counts, train_pred_flags, train_center_scores, sampled_clusters),
             line_width=1.2,
+            trace_role="active_train",
         )
         _add_trace(
             test_coords,
@@ -582,6 +765,7 @@ def _save_train_3d_visualization(
             0.56,
             _trace_hover("Test Pred Normal (center)", "test", test_pred_flags == 0, test_idx, sampled_test_true, sampled_test_counts, test_pred_flags, test_center_scores),
             line_width=1.1,
+            trace_role="test",
         )
         _add_trace(
             test_coords,
@@ -593,6 +777,7 @@ def _save_train_3d_visualization(
             0.88,
             _trace_hover("Test Pred Anomaly (center)", "test", test_pred_flags != 0, test_idx, sampled_test_true, sampled_test_counts, test_pred_flags, test_center_scores),
             line_width=1.2,
+            trace_role="test",
         )
 
     ref_specs = [
@@ -622,6 +807,7 @@ def _save_train_3d_visualization(
                 marker=dict(size=size, color=color, symbol=symbol, opacity=0.96),
             )
         )
+        trace_roles.append("reference")
 
     stage_title = {
         "stage0": "Preprocess End",
@@ -631,6 +817,8 @@ def _save_train_3d_visualization(
     summary = (
         f"{stage_title} train+test 3D | method={method_name.upper()} | "
         f"train={int(train_idx.size)} | test={int(test_idx.size)} | "
+        f"train_active={int(np.sum(sampled_active))} | "
+        f"train_filtered={int(np.sum(~sampled_active))} | "
         f"train_true_anomaly={int(np.sum(sampled_true != 0))} | "
         f"test_true_anomaly={int(np.sum(sampled_test_true != 0))}"
     )
@@ -649,6 +837,7 @@ def _save_train_3d_visualization(
         title=dict(text=summary, font=dict(size=14)),
         legend=dict(orientation="v", yanchor="top", y=0.98, xanchor="left", x=1.02),
         margin=dict(l=0, r=220, b=0, t=48),
+        updatemenus=self._filtered_trace_buttons(trace_roles),
         scene=dict(
             xaxis_title=f"{method_name.upper()}-1",
             yaxis_title=f"{method_name.upper()}-2",
@@ -662,21 +851,153 @@ def _save_train_3d_visualization(
     print(f"[Visualize] Saved {save_path}")
 
 
+def _save_point_truth_3d_visualization(
+    self,
+    stage_key: str,
+    *,
+    file_label: str,
+    feature_view: str,
+):
+    """Save point-level train/test truth latent views for dual pointwise encoders."""
+    if not bool(getattr(self.config, "enable_stage_visualization", False)):
+        return
+    try:
+        import plotly.graph_objects as go
+    except Exception as exc:
+        print(f"[Visualize] Skip point 3D {stage_key}: {type(exc).__name__}: {exc}")
+        return
+
+    vis_dir = os.path.join(self.config.save_dir, "visualizations")
+    os.makedirs(vis_dir, exist_ok=True)
+    rng = np.random.default_rng(
+        int(self.config.seed) + {"stage0": 111, "stage1": 112, "stage2": 113}.get(str(stage_key), 119)
+    )
+    max_points = int(getattr(self.config, "visualization_max_points", 3000))
+
+    train_visual_loader = self._build_full_train_visual_loader()
+    train_features, train_labels_all, train_point_indices = self._collect_point_visualization_matrix(
+        train_visual_loader,
+        feature_view=feature_view,
+    )
+    test_features, test_labels_all, test_point_indices = self._collect_point_visualization_matrix(
+        self.test_loader,
+        feature_view=feature_view,
+    )
+
+    train_idx = self._visual_sample_indices(train_labels_all, max_points, rng)
+    test_idx = self._visual_sample_indices(test_labels_all, max_points, rng)
+    train_sel = train_features[train_idx]
+    test_sel = test_features[test_idx]
+    stacked = np.concatenate([train_sel, test_sel], axis=0)
+    coords_all, method_name = self._project_visual_features_nd(stacked, stage_name=stage_key, n_components=3)
+    train_end = int(train_sel.shape[0])
+    train_coords = coords_all[:train_end]
+    test_coords = coords_all[train_end:]
+
+    sampled_train_labels = train_labels_all[train_idx]
+    sampled_test_labels = test_labels_all[test_idx]
+    sampled_train_point_indices = train_point_indices[train_idx]
+    sampled_test_point_indices = test_point_indices[test_idx]
+    sampled_train_active = self._train_visual_active_mask(train_features.shape[0])[train_idx]
+
+    fig = go.Figure()
+    trace_roles: List[str] = []
+
+    def _hover_rows(split_name: str, point_indices: np.ndarray, labels: np.ndarray, active_flags: Optional[np.ndarray] = None) -> List[str]:
+        return [
+            "<br>".join(
+                [
+                    f"split={split_name}",
+                    f"point_index={int(point_idx)}",
+                    f"truth={'anomaly' if int(label) else 'normal'}",
+                    *(
+                        [f"active_pool={'active' if bool(active_flag) else 'filtered'}"]
+                        if active_flags is not None
+                        else []
+                    ),
+                ]
+            )
+            for point_idx, label, active_flag in zip(
+                point_indices.tolist(),
+                labels.tolist(),
+                active_flags.tolist() if active_flags is not None else [True] * len(point_indices),
+            )
+        ]
+
+    def _add_trace(coords, mask, name, color, symbol, size, opacity, hover_rows, trace_role="other"):
+        mask = np.asarray(mask, dtype=bool).reshape(-1)
+        if not np.any(mask):
+            return
+        indices = np.where(mask)[0].astype(np.int64)
+        pts = coords[indices]
+        fig.add_trace(
+            go.Scatter3d(
+                x=pts[:, 0],
+                y=pts[:, 1],
+                z=pts[:, 2],
+                mode="markers",
+                name=f"{name} ({int(indices.size)})",
+                text=[hover_rows[int(i)] for i in indices],
+                hovertemplate="%{text}<br>x=%{x:.3f}<br>y=%{y:.3f}<br>z=%{z:.3f}<extra></extra>",
+                marker=dict(size=size, color=color, symbol=symbol, opacity=opacity),
+            )
+        )
+        trace_roles.append(trace_role)
+
+    train_hover = _hover_rows("train", sampled_train_point_indices, sampled_train_labels, sampled_train_active)
+    test_hover = _hover_rows("test", sampled_test_point_indices, sampled_test_labels)
+    _add_trace(train_coords, (sampled_train_labels == 0) & sampled_train_active, "Train Active Point Normal", "#16a34a", "circle", 3, 0.26, train_hover, trace_role="active_train")
+    _add_trace(train_coords, (sampled_train_labels != 0) & sampled_train_active, "Train Active Point Anomaly", "#dc2626", "circle", 5, 0.62, train_hover, trace_role="active_train")
+    _add_trace(train_coords, (sampled_train_labels == 0) & ~sampled_train_active, "Train Filtered Point Normal", "#94a3b8", "circle-open", 5, 0.52, train_hover, trace_role="filtered_train")
+    _add_trace(train_coords, (sampled_train_labels != 0) & ~sampled_train_active, "Train Filtered Point Anomaly", "#f97316", "circle-open", 6, 0.82, train_hover, trace_role="filtered_train")
+    _add_trace(test_coords, sampled_test_labels == 0, "Test Point Normal", "#65a30d", "square", 3, 0.34, test_hover, trace_role="test")
+    _add_trace(test_coords, sampled_test_labels != 0, "Test Point Anomaly", "#ef4444", "square", 5, 0.74, test_hover, trace_role="test")
+
+    stage_title = {
+        "stage0": "Stage0 End",
+        "stage1": "Stage1 End",
+        "stage2": "Stage2 Final",
+    }.get(str(stage_key).lower(), str(stage_key))
+    fig.update_layout(
+        template="plotly_white",
+        title=dict(
+            text=(
+                f"{stage_title} point-level train+test 3D | view={feature_view} | "
+                f"method={method_name.upper()} | "
+                f"train={int(train_idx.size)} | test={int(test_idx.size)} | "
+                f"train_active={int(np.sum(sampled_train_active))} | "
+                f"train_filtered={int(np.sum(~sampled_train_active))} | "
+                f"train_anomaly={int(np.sum(sampled_train_labels != 0))} | "
+                f"test_anomaly={int(np.sum(sampled_test_labels != 0))}"
+            ),
+            font=dict(size=14),
+        ),
+        legend=dict(orientation="v", yanchor="top", y=0.98, xanchor="left", x=1.02),
+        margin=dict(l=0, r=220, b=0, t=48),
+        updatemenus=self._filtered_trace_buttons(trace_roles),
+        scene=dict(
+            xaxis_title=f"{method_name.upper()}-1",
+            yaxis_title=f"{method_name.upper()}-2",
+            zaxis_title=f"{method_name.upper()}-3",
+            bgcolor="#ffffff",
+        ),
+    )
+    save_path = os.path.join(vis_dir, f"train_test3d_{file_label}_{method_name}.html")
+    fig.write_html(save_path, include_plotlyjs=True, full_html=True)
+    print(f"[Visualize] Saved {save_path}")
+
+
 def _save_dual_truth_visualizations(self, stage_key: str):
     """Save clean train/test truth-only latent views for the current model."""
     stage_key = str(stage_key).strip().lower()
     if self._is_dual_view_model():
-        self._save_train_3d_visualization(
+        self._save_point_truth_3d_visualization(
             stage_key,
-            include_structure=False,
-            include_prediction=False,
             file_label=f"{stage_key}_truth_view1",
             feature_view="v1",
         )
-        self._save_train_3d_visualization(
+        self._save_point_truth_3d_visualization(
             stage_key,
-            include_structure=False,
-            include_prediction=False,
             file_label=f"{stage_key}_truth_view2",
             feature_view="v2",
         )
@@ -698,6 +1019,7 @@ def _save_train_test_score_3d_visualization(
     test_scores: np.ndarray,
     file_label: str,
     feature_view: str = None,
+    point_level: bool = False,
 ):
     """Save a clean latent view colored by one anomaly-score component."""
     if not bool(getattr(self.config, "enable_stage_visualization", False)):
@@ -713,12 +1035,29 @@ def _save_train_test_score_3d_visualization(
     rng = np.random.default_rng(int(self.config.seed) + 97)
     max_points = int(getattr(self.config, "visualization_max_points", 3000))
 
-    train_features = self._collect_feature_matrix(self.train_eval_loader, view=feature_view)
-    test_features = self._collect_feature_matrix(self.test_loader, view=feature_view)
-    train_flags_all = self._build_train_window_anomaly_flags_for_visualization(self.train_eval_loader.dataset)
-    test_flags_all = self._build_window_anomaly_flags(self.test_loader.dataset)
-    train_counts_all = self._build_train_window_anomaly_counts_for_visualization(self.train_eval_loader.dataset)
-    test_counts_all = self._build_window_anomaly_counts(self.test_loader.dataset)
+    train_visual_loader = self._build_full_train_visual_loader()
+    if point_level:
+        train_features, train_flags_all, train_source_indices = self._collect_point_visualization_matrix(
+            train_visual_loader,
+            feature_view=feature_view,
+        )
+        test_features, test_flags_all, test_source_indices = self._collect_point_visualization_matrix(
+            self.test_loader,
+            feature_view=feature_view,
+        )
+        train_counts_all = train_flags_all.copy()
+        test_counts_all = test_flags_all.copy()
+        item_name = "point"
+    else:
+        train_features = self._collect_feature_matrix(train_visual_loader, view=feature_view)
+        test_features = self._collect_feature_matrix(self.test_loader, view=feature_view)
+        train_flags_all = self._build_train_window_anomaly_flags_for_visualization(train_visual_loader.dataset)
+        test_flags_all = self._build_window_anomaly_flags(self.test_loader.dataset)
+        train_counts_all = self._build_train_window_anomaly_counts_for_visualization(train_visual_loader.dataset)
+        test_counts_all = self._build_window_anomaly_counts(self.test_loader.dataset)
+        train_source_indices = np.arange(train_features.shape[0], dtype=np.int64)
+        test_source_indices = np.arange(test_features.shape[0], dtype=np.int64)
+        item_name = "window"
     train_idx = self._visual_sample_indices(train_flags_all, max_points, rng)
     test_idx = self._visual_sample_indices(test_flags_all, max_points, rng)
 
@@ -765,16 +1104,29 @@ def _save_train_test_score_3d_visualization(
     sampled_test_true = test_flags_all[test_idx]
     sampled_train_counts = train_counts_all[train_idx]
     sampled_test_counts = test_counts_all[test_idx]
+    sampled_train_active = self._train_visual_active_mask(train_features.shape[0])[train_idx]
 
-    def _hover(split_name: str, sample_indices: np.ndarray, true_flags: np.ndarray, counts: np.ndarray, scores: np.ndarray) -> List[str]:
+    def _hover(
+        split_name: str,
+        sample_indices: np.ndarray,
+        true_flags: np.ndarray,
+        counts: np.ndarray,
+        scores: np.ndarray,
+        active_flags: Optional[np.ndarray] = None,
+    ) -> List[str]:
         rows: List[str] = []
         for local_idx, dataset_idx in enumerate(sample_indices.tolist()):
             rows.append(
                 "<br>".join(
                     [
                         f"split={split_name}",
-                        f"index={int(dataset_idx)}",
+                        f"{item_name}_index={int(dataset_idx)}",
                         f"truth={'anomaly' if int(true_flags[local_idx]) else 'normal'}",
+                        *(
+                            [f"active_pool={'active' if bool(active_flags[local_idx]) else 'filtered'}"]
+                            if active_flags is not None
+                            else []
+                        ),
                         f"anomaly_count={int(counts[local_idx])}",
                         f"{score_name}={float(scores[local_idx]):.6f}",
                     ]
@@ -782,12 +1134,28 @@ def _save_train_test_score_3d_visualization(
             )
         return rows
 
-    train_hover = _hover("train", train_idx, sampled_train_true, sampled_train_counts, train_score_sel)
-    test_hover = _hover("test", test_idx, sampled_test_true, sampled_test_counts, test_score_sel)
+    train_hover = _hover(
+        "train",
+        train_source_indices[train_idx],
+        sampled_train_true,
+        sampled_train_counts,
+        train_score_sel,
+        sampled_train_active,
+    )
+    test_hover = _hover("test", test_source_indices[test_idx], sampled_test_true, sampled_test_counts, test_score_sel)
 
     fig = go.Figure()
+    trace_roles: List[str] = []
 
-    def _add_trace(coords: np.ndarray, mask: np.ndarray, name: str, symbol: str, scores: np.ndarray, hover_text: List[str]):
+    def _add_trace(
+        coords: np.ndarray,
+        mask: np.ndarray,
+        name: str,
+        symbol: str,
+        scores: np.ndarray,
+        hover_text: List[str],
+        trace_role: str = "other",
+    ):
         mask = np.asarray(mask, dtype=bool).reshape(-1)
         if not np.any(mask):
             return
@@ -811,11 +1179,14 @@ def _save_train_test_score_3d_visualization(
                 ),
             )
         )
+        trace_roles.append(trace_role)
 
-    _add_trace(train_coords, sampled_train_true == 0, "Train True Normal", "circle", train_score_sel, train_hover)
-    _add_trace(train_coords, sampled_train_true != 0, "Train True Anomaly", "circle", train_score_sel, train_hover)
-    _add_trace(test_coords, sampled_test_true == 0, "Test True Normal", "square", test_score_sel, test_hover)
-    _add_trace(test_coords, sampled_test_true != 0, "Test True Anomaly", "square", test_score_sel, test_hover)
+    _add_trace(train_coords, (sampled_train_true == 0) & sampled_train_active, "Train Active True Normal", "circle", train_score_sel, train_hover, trace_role="active_train")
+    _add_trace(train_coords, (sampled_train_true != 0) & sampled_train_active, "Train Active True Anomaly", "circle", train_score_sel, train_hover, trace_role="active_train")
+    _add_trace(train_coords, (sampled_train_true == 0) & ~sampled_train_active, "Train Filtered True Normal", "circle-open", train_score_sel, train_hover, trace_role="filtered_train")
+    _add_trace(train_coords, (sampled_train_true != 0) & ~sampled_train_active, "Train Filtered True Anomaly", "circle-open", train_score_sel, train_hover, trace_role="filtered_train")
+    _add_trace(test_coords, sampled_test_true == 0, "Test True Normal", "square", test_score_sel, test_hover, trace_role="test")
+    _add_trace(test_coords, sampled_test_true != 0, "Test True Anomaly", "square", test_score_sel, test_hover, trace_role="test")
     if prototype_coords.size > 0:
         labels = [f"Prototype {idx + 1}" for idx in range(prototype_coords.shape[0])]
         fig.add_trace(
@@ -831,6 +1202,7 @@ def _save_train_test_score_3d_visualization(
                 marker=dict(size=8, color="#111827", symbol="diamond-open", opacity=0.98),
             )
         )
+        trace_roles.append("reference")
 
     stage_title = {
         "stage0": "Stage0 End",
@@ -843,6 +1215,9 @@ def _save_train_test_score_3d_visualization(
         title=dict(
             text=(
                 f"{stage_title} {view_name} score={score_name} | method={method_name.upper()} | "
+                f"level={item_name} | "
+                f"train_active={int(np.sum(sampled_train_active))} | "
+                f"train_filtered={int(np.sum(~sampled_train_active))} | "
                 f"train_mean={float(np.mean(train_scores)):.4f} | test_mean={float(np.mean(test_scores)):.4f} | "
                 f"prototypes={int(prototype_centers.shape[0])}"
             ),
@@ -850,6 +1225,7 @@ def _save_train_test_score_3d_visualization(
         ),
         legend=dict(orientation="v", yanchor="top", y=0.98, xanchor="left", x=1.02),
         margin=dict(l=0, r=220, b=0, t=48),
+        updatemenus=self._filtered_trace_buttons(trace_roles),
         scene=dict(
             xaxis_title=f"{method_name.upper()}-1",
             yaxis_title=f"{method_name.upper()}-2",
@@ -875,8 +1251,8 @@ def _save_stage2_component_score_visualizations(self, stage_key: str = "stage2")
         print(f"[Visualize] Skip Stage2 component scores: unsupported stage2_method={method}")
         return
 
-    train_outputs = self._collect_separate_proto_eval_outputs(self.train_eval_loader)
-    test_outputs = self._collect_separate_proto_eval_outputs(self.test_loader)
+    train_outputs = self._collect_pointwise_separate_proto_eval_outputs(self._build_full_train_visual_loader())
+    test_outputs = self._collect_pointwise_separate_proto_eval_outputs(self.test_loader)
     recon_weight = float(getattr(self.config, "prototype_recon_weight", getattr(self.config, "dual_view_recon_weight", 0.5)))
     lambda_js = float(getattr(self.config, "lambda_js_score", getattr(self.config, "dual_score_weight_cv", 1.0)))
     _, train_components = compute_separate_proto_anomaly_score(
@@ -920,4 +1296,5 @@ def _save_stage2_component_score_visualizations(self, stage_key: str = "stage2")
             test_scores=test_components[score_name],
             file_label=file_label,
             feature_view=view,
+            point_level=True,
         )

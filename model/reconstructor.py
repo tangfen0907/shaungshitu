@@ -5,8 +5,11 @@ import torch.nn as nn
 class Reconstructor(nn.Module):
     """
     Decode either:
-        - legacy window-level latent vectors [B, D] into [B, C, output_len]
+        - local-window/current-point latent vectors [B, D] into [B, C, output_len]
         - point-level latent sequences [B, T, D] into [B, T, C]
+
+    In the new dual-view route output_len=1, so H_t reconstructs only the
+    current point x_t, not the whole input context window.
     """
 
     def __init__(

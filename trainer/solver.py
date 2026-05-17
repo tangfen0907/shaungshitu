@@ -9,7 +9,7 @@ from torch.optim import Adam
 from torch.utils.data import DataLoader
 
 from data_factory.data_loader import get_loader_segment
-from data_factory.triplet_dataset import _extract_window, _to_channel_first_tensor
+from data_factory.triplet_dataset import _extract_window
 from model.main_net import AnomalyDetector
 from trainer import active_pool as active_pool_methods
 from trainer import evaluator as evaluator_methods
@@ -26,7 +26,13 @@ from utils.config import Config
 
 
 
-def _batch_to_channel_first_tensor(batch, device, non_blocking: bool = False) -> torch.Tensor:
+def _batch_to_channel_first_tensor(
+    batch,
+    device,
+    non_blocking: bool = False,
+    in_channels: int = None,
+    seq_len: int = None,
+) -> torch.Tensor:
     batch = _extract_window(batch)
     if isinstance(batch, np.ndarray):
         tensor = torch.from_numpy(batch).float()
@@ -38,7 +44,16 @@ def _batch_to_channel_first_tensor(batch, device, non_blocking: bool = False) ->
     if tensor.dim() != 3:
         raise ValueError(f"Batch tensor should be 3D, got {tuple(tensor.shape)}")
 
-    if tensor.shape[1] > tensor.shape[2]:
+    if in_channels is not None and seq_len is not None:
+        in_channels = int(in_channels)
+        seq_len = int(seq_len)
+        if tensor.shape[1] == seq_len and tensor.shape[2] == in_channels:
+            tensor = tensor.transpose(1, 2).contiguous()
+        elif tensor.shape[1] == in_channels and tensor.shape[2] == seq_len:
+            tensor = tensor.contiguous()
+        elif tensor.shape[1] > tensor.shape[2]:
+            tensor = tensor.transpose(1, 2).contiguous()
+    elif tensor.shape[1] > tensor.shape[2]:
         tensor = tensor.transpose(1, 2).contiguous()
 
     return tensor.to(device, non_blocking=bool(non_blocking))
@@ -52,7 +67,13 @@ def extract_all_features(model, dataloader, device, view: str = None) -> np.ndar
     non_blocking = getattr(device, "type", "") == "cuda"
     with torch.inference_mode():
         for batch in dataloader:
-            x = _batch_to_channel_first_tensor(batch, device, non_blocking=non_blocking)
+            x = _batch_to_channel_first_tensor(
+                batch,
+                device,
+                non_blocking=non_blocking,
+                in_channels=getattr(model, "raw_in_channels", None),
+                seq_len=getattr(model, "raw_seq_len", None),
+            )
             z = model.encode(x, view=view)
             features.append(z.detach().cpu().numpy())
 
@@ -255,6 +276,13 @@ class Solver:
             "spacecraft": getattr(self.config, "spacecraft", ""),
             "metadata_path": getattr(self.config, "metadata_path", ""),
             "scaler_fit_mode": getattr(self.config, "scaler_fit_mode", "train"),
+            "left_pad_windows": bool(
+                getattr(
+                    self.config,
+                    "left_pad_windows",
+                    str(getattr(self.config, "active_view", "")).strip().lower() == "dual",
+                )
+            ),
         }
         base_step = max(1, int(getattr(self.config, "step", 1)))
         train_step = int(getattr(self.config, "train_step", -1))
@@ -297,9 +325,24 @@ class Solver:
 
     def _align_config_with_data(self):
         sample = _extract_window(self.train_loader.dataset[0])
-        window = _to_channel_first_tensor(sample)
-        self.config.in_channels = int(window.shape[0])
-        self.config.seq_len = int(window.shape[1])
+        if isinstance(sample, np.ndarray):
+            window = torch.from_numpy(sample).float()
+        elif isinstance(sample, torch.Tensor):
+            window = sample.detach().clone().float()
+        else:
+            window = torch.tensor(sample, dtype=torch.float32)
+        if window.dim() != 2:
+            raise ValueError(f"Window tensor should be 2D, got {tuple(window.shape)}")
+        # Repo loaders return windows as [L, M]. This explicit interpretation is
+        # important now that L=20 can be smaller than M (e.g. PSM/PUMP/SMD), so
+        # the old shape[0] > shape[1] heuristic would flip the axes wrongly.
+        self.config.seq_len = int(window.shape[0])
+        self.config.in_channels = int(window.shape[1])
+        if str(getattr(self.config, "active_view", "")).strip().lower() == "dual":
+            # New dual-view route: the dataloader window length is L itself.
+            # Keep dual_history_len synchronized so logs/injection config do
+            # not accidentally refer to the old T=100 + inner-L design.
+            self.config.dual_history_len = int(self.config.seq_len)
         if int(getattr(self.config, "state_dim", 0)) <= 0:
             self.config.state_dim = int(getattr(self.config, "latent_dim", 0))
 
@@ -315,7 +358,13 @@ class Solver:
         if tensor.dim() != 3:
             raise ValueError(f"Batch tensor should be 3D, got {tuple(tensor.shape)}")
 
-        if tensor.shape[1] > tensor.shape[2]:
+        in_channels = int(getattr(self.config, "in_channels", 0))
+        seq_len = int(getattr(self.config, "seq_len", 0))
+        if tensor.shape[1] == seq_len and tensor.shape[2] == in_channels:
+            tensor = tensor.transpose(1, 2).contiguous()
+        elif tensor.shape[1] == in_channels and tensor.shape[2] == seq_len:
+            tensor = tensor.contiguous()
+        elif tensor.shape[1] > tensor.shape[2]:
             tensor = tensor.transpose(1, 2).contiguous()
 
         return tensor.to(self.device, non_blocking=self._pin_memory())
@@ -367,8 +416,6 @@ class Solver:
     ) -> bool:
         if self._uses_legacy_v2_reconstruction(view):
             return False
-        if self._is_dual_view_model():
-            return True
         return tuple(x_hat.shape) == tuple(target.shape)
 
     def _target_for_reconstruction(
@@ -480,6 +527,29 @@ class Solver:
             self._stage1_reconstruction_loss(outputs["x_hat1"], target, mask, view="v1"),
             self._stage1_reconstruction_loss(outputs["x_hat2"], target, mask, view="v2"),
         )
+
+    def _cross_view_consistency_loss(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        target: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if "z1" not in outputs or "z2" not in outputs:
+            reference = outputs.get("z")
+            if reference is None:
+                return torch.zeros((), device=self.device)
+            return torch.zeros((), device=reference.device, dtype=reference.dtype)
+        return torch.mean((outputs["z1"] - outputs["z2"]) ** 2)
+
+    def _stage1_triplet_embedding_loss(
+        self,
+        z_anchor: torch.Tensor,
+        z_positive: torch.Tensor,
+        z_negative: torch.Tensor,
+    ) -> torch.Tensor:
+        d_ap_sq = torch.sum((z_anchor - z_positive) ** 2, dim=1)
+        d_an = torch.sqrt(torch.sum((z_anchor - z_negative) ** 2, dim=1) + 1e-12)
+        margin = float(getattr(self.config, "stage1_triplet_margin", 0.3))
+        return (d_ap_sq + torch.relu(margin - d_an) ** 2).mean()
 
     def _is_dual_view_model(self) -> bool:
         return bool(getattr(self.model, "is_dual_view", False))
