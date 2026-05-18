@@ -86,6 +86,7 @@ def _refresh_active_train_loaders(self):
         num_workers=self._effective_num_workers(),
         drop_last=False,
         pin_memory=self._pin_memory(),
+        generator=self._make_loader_generator(401),
     )
     self.train_eval_loader = DataLoader(
         dataset=dataset,
@@ -94,6 +95,7 @@ def _refresh_active_train_loaders(self):
         num_workers=self._effective_num_workers(),
         drop_last=False,
         pin_memory=self._pin_memory(),
+        generator=self._make_loader_generator(402),
     )
 
 

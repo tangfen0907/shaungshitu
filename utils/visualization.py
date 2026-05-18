@@ -130,6 +130,7 @@ def _build_full_train_visual_loader(self) -> DataLoader:
         num_workers=self._effective_num_workers(),
         drop_last=False,
         pin_memory=self._pin_memory(),
+        generator=self._make_loader_generator(501),
     )
 
 
@@ -1313,8 +1314,12 @@ def _save_stage2_component_score_visualizations(self, stage_key: str = "stage2")
         train_outputs["recon2"],
         train_outputs["q1"],
         train_outputs["q2"],
+        h1=train_outputs["u1"],
+        h2=train_outputs["u2"],
         q1_prev=train_outputs["q1"][train_prev],
         q2_prev=train_outputs["q2"][train_prev],
+        h1_prev=train_outputs["u1"][train_prev],
+        h2_prev=train_outputs["u2"][train_prev],
         eps=eps,
     )
     test_components = compute_separate_proto_component_scores(
@@ -1324,8 +1329,12 @@ def _save_stage2_component_score_visualizations(self, stage_key: str = "stage2")
         test_outputs["recon2"],
         test_outputs["q1"],
         test_outputs["q2"],
+        h1=test_outputs["u1"],
+        h2=test_outputs["u2"],
         q1_prev=test_outputs["q1"][test_prev],
         q2_prev=test_outputs["q2"][test_prev],
+        h1_prev=test_outputs["u1"][test_prev],
+        h2_prev=test_outputs["u2"][test_prev],
         eps=eps,
     )
 
@@ -1334,12 +1343,10 @@ def _save_stage2_component_score_visualizations(self, stage_key: str = "stage2")
         ("score_recon_v2", "v2", "stage2_score_recon_v2"),
         ("score_proto_v1", "v1", "stage2_score_proto_v1"),
         ("score_proto_v2", "v2", "stage2_score_proto_v2"),
-        ("score_dist_gap", "v1", "stage2_score_dist_gap_view1"),
-        ("score_dist_gap", "v2", "stage2_score_dist_gap_view2"),
-        ("score_cross_view_js", "v1", "stage2_score_cross_view_js_view1"),
-        ("score_cross_view_js", "v2", "stage2_score_cross_view_js_view2"),
-        ("score_temporal_js", "v1", "stage2_score_temporal_js_view1"),
-        ("score_temporal_js", "v2", "stage2_score_temporal_js_view2"),
+        ("score_proto_ap_gap_v1", "v1", "stage2_score_proto_ap_gap_v1"),
+        ("score_proto_ap_gap_v2", "v2", "stage2_score_proto_ap_gap_v2"),
+        ("score_proto_ap_gap_sum", "v1", "stage2_score_proto_ap_gap_sum_view1"),
+        ("score_proto_ap_gap_sum", "v2", "stage2_score_proto_ap_gap_sum_view2"),
     ]
     for score_name, view, file_label in specs:
         self._save_train_test_score_3d_visualization(

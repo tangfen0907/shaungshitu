@@ -128,31 +128,33 @@ def _normal_only_warmup_epoch(self, loader: DataLoader, epoch: int, total_epoch:
     from H[:, -2, :] because H has no time-token axis in the new encoder.
     N is obtained by injecting anomalies into the current local L-window.
 
-    Geometry follows the teacher-version Stage1 objective in raw latent space:
+    Geometry follows the proto-no-view-align route in raw latent space:
 
-        L_pos  = ||A-P||^2
+        L_ap   = max(||A-P|| - ap_margin, 0)^2
         L_away = max(margin - ||A-N||, 0)^2
 
-    The positive and injected-negative terms are logged separately here, but
-    their shapes match the original Stage1 injected-triplet warmup.
+    A/P smoothness is intra-view only. The cross-view consistency term is
+    retained as a diagnostic, but it does not contribute to the objective.
     """
     self.model.train()
     total_loss = 0.0
     total_rec = 0.0
     total_triplet = 0.0
-    total_cv = 0.0
-    total_pos = 0.0
+    total_cv_diag = 0.0
+    total_ap = 0.0
     total_away = 0.0
     total_rec_v1 = 0.0
     total_rec_v2 = 0.0
     total_triplet_v1 = 0.0
     total_triplet_v2 = 0.0
-    total_pos_v1 = 0.0
-    total_pos_v2 = 0.0
+    total_ap_v1 = 0.0
+    total_ap_v2 = 0.0
     total_away_v1 = 0.0
     total_away_v2 = 0.0
     total_ap_dist_v1 = 0.0
     total_ap_dist_v2 = 0.0
+    total_ap_active_ratio_v1 = 0.0
+    total_ap_active_ratio_v2 = 0.0
     total_an_dist_v1 = 0.0
     total_an_dist_v2 = 0.0
     total_z1_norm = 0.0
@@ -164,7 +166,7 @@ def _normal_only_warmup_epoch(self, loader: DataLoader, epoch: int, total_epoch:
 
     lambda_rec = float(getattr(self.config, "lambda_rec", 1.0))
     lambda_triplet = float(getattr(self.config, "lambda_stage1_triplet", 1.0))
-    lambda_cv = float(getattr(self.config, "lambda_cv_stage1", 0.2))
+    ap_margin = float(getattr(self.config, "stage1_ap_margin", 0.1))
     margin = float(getattr(self.config, "stage1_triplet_margin", 0.3))
 
     progress = tqdm(
@@ -179,7 +181,7 @@ def _normal_only_warmup_epoch(self, loader: DataLoader, epoch: int, total_epoch:
         z = outputs["z"]
         rec_v1, rec_v2 = self._dual_reconstruction_losses_from_outputs(outputs, x)
         loss_rec = 0.5 * (rec_v1 + rec_v2) if self._is_dual_view_model() else rec_v1
-        loss_cv = self._cross_view_consistency_loss(outputs, x)
+        loss_cv_diag = self._cross_view_consistency_loss(outputs, x)
 
         loss_triplet = self._zero_stage2_loss() if hasattr(self, "_zero_stage2_loss") else torch.zeros((), device=x.device)
         triplet_v1 = loss_triplet
@@ -189,11 +191,13 @@ def _normal_only_warmup_epoch(self, loader: DataLoader, epoch: int, total_epoch:
             a1 = outputs["z1"]
             a2 = outputs["z2"]
             if x_prev is None:
-                loss_pos = self._zero_stage2_loss() if hasattr(self, "_zero_stage2_loss") else torch.zeros((), device=x.device)
-                pos_v1 = loss_pos
-                pos_v2 = loss_pos
-                ap_dist_v1 = loss_pos
-                ap_dist_v2 = loss_pos
+                loss_ap = self._zero_stage2_loss() if hasattr(self, "_zero_stage2_loss") else torch.zeros((), device=x.device)
+                ap_v1 = loss_ap
+                ap_v2 = loss_ap
+                ap_dist_v1 = loss_ap
+                ap_dist_v2 = loss_ap
+                ap_active_ratio_v1 = loss_ap
+                ap_active_ratio_v2 = loss_ap
                 p1 = None
                 p2 = None
             else:
@@ -206,13 +210,15 @@ def _normal_only_warmup_epoch(self, loader: DataLoader, epoch: int, total_epoch:
             n1 = outputs_negative["z1"]
             n2 = outputs_negative["z2"]
             if p1 is not None and p2 is not None:
-                ap_sq_v1 = torch.sum((a1 - p1) ** 2, dim=-1)
-                ap_sq_v2 = torch.sum((a2 - p2) ** 2, dim=-1)
-                ap_dist_v1 = torch.sqrt(ap_sq_v1 + 1e-12).mean()
-                ap_dist_v2 = torch.sqrt(ap_sq_v2 + 1e-12).mean()
-                pos_v1 = ap_sq_v1.mean()
-                pos_v2 = ap_sq_v2.mean()
-                loss_pos = 0.5 * (pos_v1 + pos_v2)
+                ap_dist_each_v1 = torch.norm(a1 - p1, dim=-1)
+                ap_dist_each_v2 = torch.norm(a2 - p2, dim=-1)
+                ap_dist_v1 = ap_dist_each_v1.mean()
+                ap_dist_v2 = ap_dist_each_v2.mean()
+                ap_v1 = F.relu(ap_dist_each_v1 - ap_margin).pow(2).mean()
+                ap_v2 = F.relu(ap_dist_each_v2 - ap_margin).pow(2).mean()
+                ap_active_ratio_v1 = (ap_dist_each_v1 > ap_margin).float().mean()
+                ap_active_ratio_v2 = (ap_dist_each_v2 > ap_margin).float().mean()
+                loss_ap = 0.5 * (ap_v1 + ap_v2)
             an_norm_v1 = torch.norm(a1 - n1, dim=-1)
             an_norm_v2 = torch.norm(a2 - n2, dim=-1)
             an_dist_v1 = an_norm_v1.mean()
@@ -226,23 +232,27 @@ def _normal_only_warmup_epoch(self, loader: DataLoader, epoch: int, total_epoch:
                 loss_triplet = 0.5 * (triplet_v1 + triplet_v2)
         else:
             if x_prev is None:
-                loss_pos = self._zero_stage2_loss() if hasattr(self, "_zero_stage2_loss") else torch.zeros((), device=x.device)
+                loss_ap = self._zero_stage2_loss() if hasattr(self, "_zero_stage2_loss") else torch.zeros((), device=x.device)
                 z_prev = None
-                ap_dist_v1 = loss_pos
-                pos_v1 = loss_pos
-                pos_v2 = loss_pos
+                ap_dist_v1 = loss_ap
+                ap_v1 = loss_ap
+                ap_v2 = loss_ap
                 ap_dist_v2 = ap_dist_v1
+                ap_active_ratio_v1 = loss_ap
+                ap_active_ratio_v2 = loss_ap
             else:
                 z_prev = self.model.encode(x_prev)
             x_negative = self._inject_last_context(x, stage="stage1")
             n = self.model.encode(x_negative)
             if z_prev is not None:
-                ap_sq = torch.sum((z - z_prev) ** 2, dim=-1)
-                ap_dist_v1 = torch.sqrt(ap_sq + 1e-12).mean()
-                loss_pos = ap_sq.mean()
-                pos_v1 = loss_pos
-                pos_v2 = loss_pos
+                ap_dist_each = torch.norm(z - z_prev, dim=-1)
+                ap_dist_v1 = ap_dist_each.mean()
+                loss_ap = F.relu(ap_dist_each - ap_margin).pow(2).mean()
+                ap_v1 = loss_ap
+                ap_v2 = loss_ap
                 ap_dist_v2 = ap_dist_v1
+                ap_active_ratio_v1 = (ap_dist_each > ap_margin).float().mean()
+                ap_active_ratio_v2 = ap_active_ratio_v1
             an_norm = torch.norm(z - n, dim=-1)
             an_dist_v1 = an_norm.mean()
             away_v1 = F.relu(margin - an_norm).pow(2).mean()
@@ -254,7 +264,7 @@ def _normal_only_warmup_epoch(self, loader: DataLoader, epoch: int, total_epoch:
                 triplet_v1 = loss_triplet
                 triplet_v2 = loss_triplet
 
-        loss = lambda_rec * loss_rec + lambda_triplet * loss_triplet + lambda_cv * loss_cv
+        loss = lambda_rec * loss_rec + lambda_triplet * loss_triplet
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -263,19 +273,21 @@ def _normal_only_warmup_epoch(self, loader: DataLoader, epoch: int, total_epoch:
         total_loss += float(loss.item())
         total_rec += float(loss_rec.item())
         total_triplet += float(loss_triplet.item())
-        total_cv += float(loss_cv.item())
-        total_pos += float(loss_pos.item())
+        total_cv_diag += float(loss_cv_diag.item())
+        total_ap += float(loss_ap.item())
         total_away += float(loss_away.item())
         total_rec_v1 += float(rec_v1.item())
         total_rec_v2 += float(rec_v2.item())
         total_triplet_v1 += float(triplet_v1.item())
         total_triplet_v2 += float(triplet_v2.item())
-        total_pos_v1 += float(pos_v1.item())
-        total_pos_v2 += float(pos_v2.item())
+        total_ap_v1 += float(ap_v1.item())
+        total_ap_v2 += float(ap_v2.item())
         total_away_v1 += float(away_v1.item())
         total_away_v2 += float(away_v2.item())
         total_ap_dist_v1 += float(ap_dist_v1.item())
         total_ap_dist_v2 += float(ap_dist_v2.item())
+        total_ap_active_ratio_v1 += float(ap_active_ratio_v1.item())
+        total_ap_active_ratio_v2 += float(ap_active_ratio_v2.item())
         total_an_dist_v1 += float(an_dist_v1.item())
         total_an_dist_v2 += float(an_dist_v2.item())
         total_z_norm += float(torch.norm(z, dim=1).mean().item())
@@ -292,7 +304,7 @@ def _normal_only_warmup_epoch(self, loader: DataLoader, epoch: int, total_epoch:
                 "r2": f"{rec_v2.item():.4f}",
                 "t1": f"{triplet_v1.item():.4f}",
                 "t2": f"{triplet_v2.item():.4f}",
-                "cv": f"{loss_cv.item():.4f}",
+                "ap": f"{loss_ap.item():.4f}",
             }
         )
 
@@ -301,11 +313,12 @@ def _normal_only_warmup_epoch(self, loader: DataLoader, epoch: int, total_epoch:
         "loss": total_loss / denom,
         "loss_rec": total_rec / denom,
         "loss_triplet": total_triplet / denom,
-        "loss_cv": total_cv / denom,
-        "loss_pos": total_pos / denom,
+        "loss_ap": total_ap / denom,
+        "loss_cv_diag": total_cv_diag / denom,
         "loss_away": total_away / denom,
         "z_norm": total_z_norm / denom,
         "z_std": total_z_std / denom,
+        "stage1_ap_margin": ap_margin,
     }
     if self._is_dual_view_model():
         logs.update(
@@ -314,12 +327,14 @@ def _normal_only_warmup_epoch(self, loader: DataLoader, epoch: int, total_epoch:
                 "rec_v2": total_rec_v2 / denom,
                 "triplet_v1": total_triplet_v1 / denom,
                 "triplet_v2": total_triplet_v2 / denom,
-                "pos_v1": total_pos_v1 / denom,
-                "pos_v2": total_pos_v2 / denom,
+                "ap_v1": total_ap_v1 / denom,
+                "ap_v2": total_ap_v2 / denom,
                 "away_v1": total_away_v1 / denom,
                 "away_v2": total_away_v2 / denom,
-                "ap_dist_v1": total_ap_dist_v1 / denom,
-                "ap_dist_v2": total_ap_dist_v2 / denom,
+                "ap_dist_v1_mean": total_ap_dist_v1 / denom,
+                "ap_dist_v2_mean": total_ap_dist_v2 / denom,
+                "ap_active_ratio_v1": total_ap_active_ratio_v1 / denom,
+                "ap_active_ratio_v2": total_ap_active_ratio_v2 / denom,
                 "an_dist_v1": total_an_dist_v1 / denom,
                 "an_dist_v2": total_an_dist_v2 / denom,
                 "z1_norm": total_z1_norm / denom,
@@ -365,6 +380,7 @@ def _build_stage1_loader(self) -> DataLoader:
         num_workers=self._effective_num_workers(),
         drop_last=False,
         pin_memory=self._pin_memory(),
+        generator=self._make_loader_generator(201),
     )
 
 

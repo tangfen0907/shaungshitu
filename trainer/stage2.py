@@ -9,8 +9,12 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from data_factory.triplet_dataset import Stage1AdjacentPairDataset
-from utils.clustering import _cluster_boundary_radii, _cluster_features, _nearest_other_clusters
+from utils.clustering import _cluster_features, _nearest_other_clusters
 
+# This route removes strong cross-view alignment from the dual-view prototype
+# pipeline. A one-shot Hungarian reorder is allowed only at initialization so
+# prototype IDs start in a readable order; after that, the two views keep
+# independent representation and prototype spaces.
 
 __all__ = [
     "_stage2_total_epochs",
@@ -27,13 +31,17 @@ __all__ = [
     "_select_a_core",
     "_select_a_core_mask_by_proto",
     "_prototype_core_pull_loss",
+    "_prototype_assignment_pull_loss",
     "_prototype_separation_loss",
     "_stage2_a_batch_loss",
     "_stage2_a_collect_calibration_data",
     "_stage2_a_ema_update_one_view",
     "_run_stage2_a_epoch",
     "_select_b_core",
+    "_select_per_proto_core_mask",
     "_prepare_stage2_b_batch",
+    "_per_proto_radius_quantiles",
+    "_refresh_stage2_boundary_radii",
     "_stage2_b_batch_loss",
     "_run_stage2_b_epoch",
     "_refresh_aligned_stage2_state",
@@ -156,14 +164,30 @@ def _initialize_aligned_separate_prototypes(self):
 
     matched_count = int(overlap[np.arange(num_prototypes), match].sum())
     total_count = int(labels1.shape[0])
+    counts_v1 = np.bincount(labels1.astype(np.int64), minlength=num_prototypes).astype(int).tolist()
+    counts_v2 = np.bincount(labels2.astype(np.int64), minlength=num_prototypes).astype(int).tolist()
+    overlap_nonzero = int(np.count_nonzero(overlap))
+    overlap_max = int(np.max(overlap)) if overlap.size else 0
     print(
-        "[Stage2-Init] aligned separate prototypes | "
-        f"features={tuple(z1.shape)} | "
+        "[Stage2-Init] independent KMeans prototypes | "
+        f"H1_train={tuple(z1.shape)} | "
+        f"H2_train={tuple(z2.shape)} | "
         f"K={num_prototypes} | "
         f"kmeans_v1={meta1.get('cluster_method_actual', 'kmeans')} | "
-        f"kmeans_v2={meta2.get('cluster_method_actual', 'kmeans')} | "
+        f"kmeans_v2={meta2.get('cluster_method_actual', 'kmeans')}"
+    )
+    print(
+        "[Stage2-Init] assignment counts | "
+        f"view1={counts_v1} | "
+        f"view2={counts_v2}"
+    )
+    print(
+        "[Stage2-Init] one-shot ID alignment only | "
+        f"overlap_nonzero={overlap_nonzero}/{int(overlap.size)} | "
+        f"overlap_max={overlap_max} | "
         f"matched_overlap={matched_count}/{total_count} | "
-        f"match={match.astype(int).tolist()}"
+        f"match={match.astype(int).tolist()} | "
+        "no coordinate alignment loss will be used"
     )
 
 
@@ -218,6 +242,7 @@ def _build_stage2_b_loader(self) -> DataLoader:
         num_workers=self._effective_num_workers(),
         drop_last=False,
         pin_memory=self._pin_memory(),
+        generator=self._make_loader_generator(301),
     )
 
 
@@ -337,6 +362,16 @@ def _prototype_core_pull_loss(
     return torch.sum((selected_embeddings - selected_prototypes) ** 2, dim=1).mean()
 
 
+def _prototype_assignment_pull_loss(
+    self,
+    embeddings: torch.Tensor,
+    prototypes: torch.Tensor,
+    labels: torch.Tensor,
+) -> torch.Tensor:
+    selected_prototypes = prototypes[labels.long()]
+    return torch.sum((embeddings.detach() - selected_prototypes) ** 2, dim=1).mean()
+
+
 def _prototype_separation_loss(self, prototypes: torch.Tensor) -> torch.Tensor:
     if int(prototypes.size(0)) <= 1:
         return prototypes.sum() * 0.0
@@ -357,55 +392,40 @@ def _stage2_a_batch_loss(self, batch) -> Tuple[torch.Tensor, Dict[str, torch.Ten
         outputs = self.model(x, stage="stage2", detach_prototypes=True)
         h1 = outputs["H1"].detach()
         h2 = outputs["H2"].detach()
-        recon1 = self._mse_per_sample(x, outputs["x_hat1"], view="v1")
-        recon2 = self._mse_per_sample(x, outputs["x_hat2"], view="v2")
-        recon_score = 0.5 * (recon1 + recon2)
 
     p1 = self.model.prototype_head_v1.prototypes
     p2 = self.model.prototype_head_v2.prototypes
-    temperature = max(float(getattr(self.model.prototype_head_v1, "temperature", 0.2)), 1e-6)
 
     dist_mat1 = torch.cdist(h1, p1, p=2.0).pow(2)
     dist_mat2 = torch.cdist(h2, p2, p=2.0).pow(2)
-    q1 = F.softmax(-dist_mat1 / temperature, dim=1)
-    q2 = F.softmax(-dist_mat2 / temperature, dim=1)
     min_dist1, pred1 = torch.min(dist_mat1, dim=1)
     min_dist2, pred2 = torch.min(dist_mat2, dim=1)
 
-    dist_score = 0.5 * (min_dist1 + min_dist2)
-    align_score = torch.mean((q1 - q2) ** 2, dim=1)
-    score_a = (
-        float(getattr(self.config, "alpha_A", 1.0)) * dist_score
-        + float(getattr(self.config, "beta_A", 1.0)) * align_score
-        + float(getattr(self.config, "gamma_A", 0.5)) * recon_score
-    )
-
-    num_prototypes = int(p1.size(0))
-    core_mask_v1 = self._select_a_core_mask_by_proto(score_a, pred1, num_prototypes)
-    core_mask_v2 = self._select_a_core_mask_by_proto(score_a, pred2, num_prototypes)
-    pull_v1 = self._prototype_core_pull_loss(h1, p1, pred1, core_mask_v1)
-    pull_v2 = self._prototype_core_pull_loss(h2, p2, pred2, core_mask_v2)
-    loss_core_a = 0.5 * (pull_v1 + pull_v2)
-    loss_pair_a = F.mse_loss(p1, p2)
-    loss_sep_a = 0.5 * (
-        self._prototype_separation_loss(p1)
-        + self._prototype_separation_loss(p2)
-    )
+    pull_v1 = self._prototype_assignment_pull_loss(h1, p1, pred1)
+    pull_v2 = self._prototype_assignment_pull_loss(h2, p2, pred2)
+    loss_pull_a = 0.5 * (pull_v1 + pull_v2)
+    sep_v1 = self._prototype_separation_loss(p1)
+    sep_v2 = self._prototype_separation_loss(p2)
+    loss_sep_a = 0.5 * (sep_v1 + sep_v2)
     loss = (
-        float(getattr(self.config, "lambda_pull_A", 1.0)) * loss_core_a
-        + float(getattr(self.config, "lambda_pair_A", 0.1)) * loss_pair_a
+        float(getattr(self.config, "lambda_pull_A", 1.0)) * loss_pull_a
         + float(getattr(self.config, "lambda_sep_A", 0.1)) * loss_sep_a
     )
+    assign_count_v1 = torch.bincount(pred1.detach(), minlength=int(p1.size(0))).to(dtype=loss.dtype)
+    assign_count_v2 = torch.bincount(pred2.detach(), minlength=int(p2.size(0))).to(dtype=loss.dtype)
     return loss, {
         "loss": loss,
-        "loss_core_A": loss_core_a,
-        "loss_pair_A": loss_pair_a,
+        "loss_A": loss,
+        "loss_pull_A": loss_pull_a,
+        "loss_pull_v1": pull_v1,
+        "loss_pull_v2": pull_v2,
         "loss_sep_A": loss_sep_a,
-        "core_ratio_v1": core_mask_v1.float().mean(),
-        "core_ratio_v2": core_mask_v2.float().mean(),
-        "core_count_v1": core_mask_v1.float().sum(),
-        "core_count_v2": core_mask_v2.float().sum(),
-        "pair_mse": loss_pair_a,
+        "loss_sep_v1": sep_v1,
+        "loss_sep_v2": sep_v2,
+        "assign_count_v1": assign_count_v1,
+        "assign_count_v2": assign_count_v2,
+        "empty_proto_count_v1": (assign_count_v1 == 0).float().sum(),
+        "empty_proto_count_v2": (assign_count_v2 == 0).float().sum(),
         "prototype_min_dist_v1": torch.as_tensor(
             _prototype_min_pairwise_distance(p1.detach()),
             device=p1.device,
@@ -416,9 +436,9 @@ def _stage2_a_batch_loss(self, batch) -> Tuple[torch.Tensor, Dict[str, torch.Ten
             device=p2.device,
             dtype=p2.dtype,
         ),
-        "dist_score_mean": dist_score.mean(),
-        "align_score_mean": align_score.mean(),
-        "recon_score_mean": recon_score.mean(),
+        "min_proto_dist_v1_mean": torch.sqrt(min_dist1.clamp_min(0.0) + 1e-12).mean(),
+        "min_proto_dist_v2_mean": torch.sqrt(min_dist2.clamp_min(0.0) + 1e-12).mean(),
+        "pair_mse_diag": F.mse_loss(p1, p2).detach(),
         "batch_size": torch.as_tensor(float(x.size(0)), device=x.device, dtype=loss.dtype),
     }
 
@@ -551,18 +571,23 @@ def _run_stage2_a_epoch(
     self._set_stage2_train_phase("A")
     totals = {
         "loss": 0.0,
-        "loss_core_A": 0.0,
-        "loss_pair_A": 0.0,
+        "loss_A": 0.0,
+        "loss_pull_A": 0.0,
+        "loss_pull_v1": 0.0,
+        "loss_pull_v2": 0.0,
         "loss_sep_A": 0.0,
+        "loss_sep_v1": 0.0,
+        "loss_sep_v2": 0.0,
+        "empty_proto_count_v1": 0.0,
+        "empty_proto_count_v2": 0.0,
     }
     sample_weighted_totals = {
-        "dist_score_mean": 0.0,
-        "align_score_mean": 0.0,
-        "recon_score_mean": 0.0,
+        "min_proto_dist_v1_mean": 0.0,
+        "min_proto_dist_v2_mean": 0.0,
     }
     total_samples = 0.0
-    total_core_v1 = 0.0
-    total_core_v2 = 0.0
+    assign_count_v1_total = None
+    assign_count_v2_total = None
 
     progress = tqdm(
         loader,
@@ -578,17 +603,21 @@ def _run_stage2_a_epoch(
 
         batch_size = float(metrics["batch_size"].item())
         total_samples += batch_size
-        total_core_v1 += float(metrics["core_count_v1"].item())
-        total_core_v2 += float(metrics["core_count_v2"].item())
         for key in totals:
             totals[key] += float(metrics[key].item())
         for key in sample_weighted_totals:
             sample_weighted_totals[key] += float(metrics[key].item()) * batch_size
+        batch_assign_v1 = metrics["assign_count_v1"].detach().cpu().numpy().astype(np.int64)
+        batch_assign_v2 = metrics["assign_count_v2"].detach().cpu().numpy().astype(np.int64)
+        if assign_count_v1_total is None:
+            assign_count_v1_total = np.zeros_like(batch_assign_v1, dtype=np.int64)
+            assign_count_v2_total = np.zeros_like(batch_assign_v2, dtype=np.int64)
+        assign_count_v1_total += batch_assign_v1
+        assign_count_v2_total += batch_assign_v2
         progress.set_postfix(
             {
                 "loss": f"{loss.item():.4f}",
-                "core": f"{metrics['loss_core_A'].item():.4f}",
-                "pair": f"{metrics['loss_pair_A'].item():.4f}",
+                "pull": f"{metrics['loss_pull_A'].item():.4f}",
                 "sep": f"{metrics['loss_sep_A'].item():.4f}",
             }
         )
@@ -599,43 +628,50 @@ def _run_stage2_a_epoch(
     p2 = self.model.prototype_head_v2.prototypes.detach()
     diagnostics = {
         "loss": totals["loss"] / denom,
-        "loss_core_A": totals["loss_core_A"] / denom,
-        "loss_pair_A": totals["loss_pair_A"] / denom,
+        "loss_A": totals["loss_A"] / denom,
+        "loss_pull_A": totals["loss_pull_A"] / denom,
+        "loss_pull_v1": totals["loss_pull_v1"] / denom,
+        "loss_pull_v2": totals["loss_pull_v2"] / denom,
         "loss_sep_A": totals["loss_sep_A"] / denom,
-        "core_ratio_v1": total_core_v1 / sample_denom,
-        "core_ratio_v2": total_core_v2 / sample_denom,
-        "pair_mse": float(F.mse_loss(p1, p2).item()),
+        "loss_sep_v1": totals["loss_sep_v1"] / denom,
+        "loss_sep_v2": totals["loss_sep_v2"] / denom,
+        "empty_proto_count_v1": int(np.sum(assign_count_v1_total == 0)) if assign_count_v1_total is not None else 0,
+        "empty_proto_count_v2": int(np.sum(assign_count_v2_total == 0)) if assign_count_v2_total is not None else 0,
+        "pair_mse_diag": float(F.mse_loss(p1, p2).item()),
         "prototype_min_dist_v1": _prototype_min_pairwise_distance(p1),
         "prototype_min_dist_v2": _prototype_min_pairwise_distance(p2),
-        "dist_score_mean": sample_weighted_totals["dist_score_mean"] / sample_denom,
-        "align_score_mean": sample_weighted_totals["align_score_mean"] / sample_denom,
-        "recon_score_mean": sample_weighted_totals["recon_score_mean"] / sample_denom,
+        "min_proto_dist_v1_mean": sample_weighted_totals["min_proto_dist_v1_mean"] / sample_denom,
+        "min_proto_dist_v2_mean": sample_weighted_totals["min_proto_dist_v2_mean"] / sample_denom,
     }
     self.stage2_a_last_diagnostics = dict(diagnostics)
 
     print(
         "[Stage2-A] learnable prototype training | "
         f"round={round_idx} | epoch_in_phase={epoch_in_phase} | "
-        f"core_ratio_A={float(getattr(self.config, 'core_ratio_A', 0.3)):.3f} | "
-        f"min_core_per_proto={int(getattr(self.config, 'min_core_per_proto', 1))} | "
         f"lambda_pull_A={float(getattr(self.config, 'lambda_pull_A', 1.0)):.3f} | "
-        f"lambda_pair_A={float(getattr(self.config, 'lambda_pair_A', 0.1)):.3f} | "
         f"lambda_sep_A={float(getattr(self.config, 'lambda_sep_A', 0.1)):.3f}"
     )
     print(
         "[Stage2-A] diagnostics | "
         f"loss={diagnostics['loss']:.6f} | "
-        f"loss_core_A={diagnostics['loss_core_A']:.6f} | "
-        f"loss_pair_A={diagnostics['loss_pair_A']:.6f} | "
+        f"loss_pull_A={diagnostics['loss_pull_A']:.6f} | "
+        f"loss_pull_v1={diagnostics['loss_pull_v1']:.6f} | "
+        f"loss_pull_v2={diagnostics['loss_pull_v2']:.6f} | "
         f"loss_sep_A={diagnostics['loss_sep_A']:.6f} | "
-        f"core_ratio_v1={diagnostics['core_ratio_v1']:.6f} | "
-        f"core_ratio_v2={diagnostics['core_ratio_v2']:.6f} | "
-        f"pair_mse={diagnostics['pair_mse']:.6f} | "
+        f"loss_sep_v1={diagnostics['loss_sep_v1']:.6f} | "
+        f"loss_sep_v2={diagnostics['loss_sep_v2']:.6f} | "
+        f"empty_proto_count_v1={diagnostics['empty_proto_count_v1']:.6f} | "
+        f"empty_proto_count_v2={diagnostics['empty_proto_count_v2']:.6f} | "
+        f"pair_mse_diag={diagnostics['pair_mse_diag']:.6f} | "
         f"prototype_min_dist_v1={diagnostics['prototype_min_dist_v1']:.6f} | "
         f"prototype_min_dist_v2={diagnostics['prototype_min_dist_v2']:.6f} | "
-        f"dist_score_mean={diagnostics['dist_score_mean']:.6f} | "
-        f"align_score_mean={diagnostics['align_score_mean']:.6f} | "
-        f"recon_score_mean={diagnostics['recon_score_mean']:.6f}"
+        f"min_proto_dist_v1_mean={diagnostics['min_proto_dist_v1_mean']:.6f} | "
+        f"min_proto_dist_v2_mean={diagnostics['min_proto_dist_v2_mean']:.6f}"
+    )
+    print(
+        "[Stage2-A] assignment counts | "
+        f"view1={(assign_count_v1_total.astype(int).tolist() if assign_count_v1_total is not None else [])} | "
+        f"view2={(assign_count_v2_total.astype(int).tolist() if assign_count_v2_total is not None else [])}"
     )
 
     self._log_epoch("Stage2-A", global_epoch, total_epochs, diagnostics)
@@ -670,6 +706,35 @@ def _select_b_core(self, outputs: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor
     }
 
 
+def _select_per_proto_core_mask(
+    self,
+    score: torch.Tensor,
+    labels: torch.Tensor,
+    num_prototypes: int,
+) -> torch.Tensor:
+    if score.dim() != 1 or labels.dim() != 1:
+        raise ValueError("Per-prototype core selection expects score [B] and labels [B].")
+    if score.shape[0] != labels.shape[0]:
+        raise ValueError(f"Per-prototype score/label mismatch: {score.shape[0]} vs {labels.shape[0]}.")
+
+    ratio = min(max(float(getattr(self.config, "core_ratio_B", 0.5)), 0.0), 1.0)
+    core_mask = torch.zeros_like(score, dtype=torch.bool)
+    if ratio <= 0.0:
+        return core_mask
+
+    with torch.no_grad():
+        for proto_id in range(int(num_prototypes)):
+            proto_indices = torch.nonzero(labels == proto_id, as_tuple=False).flatten()
+            count = int(proto_indices.numel())
+            if count <= 0:
+                continue
+            keep_count = max(1, int(np.ceil(float(count) * ratio)))
+            keep_count = min(keep_count, count)
+            order = torch.argsort(score.detach()[proto_indices], stable=True)
+            core_mask[proto_indices[order[:keep_count]]] = True
+    return core_mask
+
+
 def _prepare_stage2_b_batch(self, batch) -> Tuple[torch.Tensor, torch.Tensor, bool]:
     """
     Return (x_t, x_prev, has_prev) for Stage2-B.
@@ -689,11 +754,86 @@ def _prepare_stage2_b_batch(self, batch) -> Tuple[torch.Tensor, torch.Tensor, bo
     return x_t, x_t, False
 
 
+def _per_proto_radius_quantiles(
+    self,
+    labels: np.ndarray,
+    min_distances: np.ndarray,
+    num_prototypes: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    labels = np.asarray(labels, dtype=np.int64).reshape(-1)
+    min_distances = np.asarray(min_distances, dtype=np.float32).reshape(-1)
+    if labels.shape[0] != min_distances.shape[0]:
+        raise ValueError("Prototype labels and distances should have the same number of samples.")
+
+    num_prototypes = int(num_prototypes)
+    quantile = min(max(float(getattr(self.config, "boundary_quantile", 0.95)), 0.0), 1.0)
+    eps = float(getattr(self.config, "robust_eps", 1e-6))
+    radii = np.full(num_prototypes, np.nan, dtype=np.float32)
+    counts = np.bincount(labels, minlength=num_prototypes).astype(np.int64)
+
+    for proto_id in range(num_prototypes):
+        proto_dist = min_distances[labels == proto_id]
+        if proto_dist.size == 0:
+            continue
+        radius = float(np.quantile(proto_dist, quantile))
+        if np.isfinite(radius):
+            radii[proto_id] = max(radius, eps)
+
+    finite = np.isfinite(radii)
+    fallback = (
+        float(np.median(radii[finite]))
+        if bool(np.any(finite))
+        else float(getattr(self.config, "stage2_injected_margin", 1.0))
+    )
+    fallback = max(float(fallback), eps)
+    radii[~finite] = fallback
+    return radii.astype(np.float32), counts
+
+
+def _refresh_stage2_boundary_radii(self):
+    self._uses_separate_prototypes()
+    was_training = self.model.training
+    self.model.eval()
+    collected: Dict[str, List[np.ndarray]] = {
+        "pred1": [],
+        "pred2": [],
+        "dist1": [],
+        "dist2": [],
+    }
+    with torch.inference_mode():
+        for batch in self.train_eval_loader:
+            x = self._prepare_batch(batch)
+            outputs = self.model(x, stage="stage2", detach_prototypes=True)
+            collected["pred1"].append(outputs["proto_pred1"].detach().cpu().numpy())
+            collected["pred2"].append(outputs["proto_pred2"].detach().cpu().numpy())
+            collected["dist1"].append(outputs["proto_dist1"].detach().cpu().numpy())
+            collected["dist2"].append(outputs["proto_dist2"].detach().cpu().numpy())
+    if was_training:
+        self.model.train()
+
+    arrays = {key: np.concatenate(values, axis=0) for key, values in collected.items()}
+    num_prototypes = int(self.model.prototype_head_v1.prototypes.size(0))
+    radii_v1, counts_v1 = self._per_proto_radius_quantiles(arrays["pred1"], arrays["dist1"], num_prototypes)
+    radii_v2, counts_v2 = self._per_proto_radius_quantiles(arrays["pred2"], arrays["dist2"], num_prototypes)
+    self.stage2_boundary_radii_v1 = radii_v1
+    self.stage2_boundary_radii_v2 = radii_v2
+    self.stage2_boundary_assignment_counts_v1 = counts_v1
+    self.stage2_boundary_assignment_counts_v2 = counts_v2
+    print(
+        "[Stage2-B] refreshed independent boundary radii | "
+        f"quantile={float(getattr(self.config, 'boundary_quantile', 0.95)):.3f} | "
+        f"radius_v1_mean={float(np.mean(radii_v1)):.6f} | "
+        f"radius_v2_mean={float(np.mean(radii_v2)):.6f} | "
+        f"assign_v1={counts_v1.astype(int).tolist()} | "
+        f"assign_v2={counts_v2.astype(int).tolist()}"
+    )
+
+
 def _stage2_b_batch_loss(self, batch) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     x_t, x_prev, has_prev = self._prepare_stage2_b_batch(batch)
 
-    outputs_t = self.model(x_t, stage="stage2")
-    outputs_p = self.model(x_prev, stage="stage2")
+    outputs_t = self.model(x_t, stage="stage2", detach_prototypes=True)
+    outputs_p = self.model(x_prev, stage="stage2", detach_prototypes=True)
     x_negative = self._inject_last_context(x_t, stage="stage2")
     outputs_n = self.model(x_negative, stage="stage2", detach_prototypes=True)
 
@@ -708,120 +848,129 @@ def _stage2_b_batch_loss(self, batch) -> Tuple[torch.Tensor, Dict[str, torch.Ten
 
     D1_t = torch.cdist(H1_t, P1, p=2.0).pow(2)
     D2_t = torch.cdist(H2_t, P2, p=2.0).pow(2)
-    D1_p = torch.cdist(H1_p, P1, p=2.0).pow(2)
-    D2_p = torch.cdist(H2_p, P2, p=2.0).pow(2)
     D1_n = torch.cdist(H1_n, P1, p=2.0).pow(2)
     D2_n = torch.cdist(H2_n, P2, p=2.0).pow(2)
 
+    stage2_ap_margin = float(getattr(self.config, "stage2_ap_margin", 0.1))
     if bool(has_prev):
-        loss_ap_v1 = torch.sum((H1_t - H1_p) ** 2, dim=1).mean()
-        loss_ap_v2 = torch.sum((H2_t - H2_p) ** 2, dim=1).mean()
+        ap_dist_v1 = torch.norm(H1_t - H1_p, dim=1)
+        ap_dist_v2 = torch.norm(H2_t - H2_p, dim=1)
+        loss_ap_v1 = F.relu(ap_dist_v1 - stage2_ap_margin).pow(2).mean()
+        loss_ap_v2 = F.relu(ap_dist_v2 - stage2_ap_margin).pow(2).mean()
         loss_ap = 0.5 * (loss_ap_v1 + loss_ap_v2)
+        ap_active_ratio_v1 = (ap_dist_v1 > stage2_ap_margin).float().mean()
+        ap_active_ratio_v2 = (ap_dist_v2 > stage2_ap_margin).float().mean()
     else:
         loss_ap = H1_t.sum() * 0.0
+        ap_dist_v1 = torch.zeros_like(H1_t[:, 0])
+        ap_dist_v2 = torch.zeros_like(H2_t[:, 0])
+        loss_ap_v1 = loss_ap
+        loss_ap_v2 = loss_ap
+        ap_active_ratio_v1 = loss_ap
+        ap_active_ratio_v2 = loss_ap
 
-    min_d1_n = torch.min(D1_n, dim=1).values
-    min_d2_n = torch.min(D2_n, dim=1).values
-    min_d1_t = torch.min(D1_t, dim=1).values
-    min_d2_t = torch.min(D2_t, dim=1).values
-    margin = float(getattr(self.config, "margin_anom", 1.0))
-    loss_out = 0.5 * (
-        F.relu(margin - min_d1_n).pow(2).mean()
-        + F.relu(margin - min_d2_n).pow(2).mean()
-    )
+    min_d1_t_sq, k1_t = torch.min(D1_t, dim=1)
+    min_d2_t_sq, k2_t = torch.min(D2_t, dim=1)
+    min_d1_n_sq, k1_n = torch.min(D1_n, dim=1)
+    min_d2_n_sq, k2_n = torch.min(D2_n, dim=1)
+    min_d1_t = torch.sqrt(min_d1_t_sq.clamp_min(0.0) + 1e-12)
+    min_d2_t = torch.sqrt(min_d2_t_sq.clamp_min(0.0) + 1e-12)
+    min_d1_n = torch.sqrt(min_d1_n_sq.clamp_min(0.0) + 1e-12)
+    min_d2_n = torch.sqrt(min_d2_n_sq.clamp_min(0.0) + 1e-12)
 
-    k1_t = torch.argmin(D1_t, dim=1)
-    k2_t = torch.argmin(D2_t, dim=1)
-    k1_p = torch.argmin(D1_p, dim=1)
-    k2_p = torch.argmin(D2_p, dim=1)
-    same_proto = (k1_t == k2_t) & (k1_t == k1_p) & (k1_t == k2_p)
-    k = k1_t
-    batch_indices = torch.arange(int(x_t.size(0)), device=x_t.device)
-    d1_t = D1_t[batch_indices, k]
-    d2_t = D2_t[batch_indices, k]
-    d1_p = D1_p[batch_indices, k]
-    d2_p = D2_p[batch_indices, k]
-    same_dist_score = (
-        torch.abs(d1_t - d2_t)
-        + torch.abs(d1_p - d2_p)
-        + torch.abs(d1_t - d1_p)
-        + torch.abs(d2_t - d2_p)
-    )
+    num_prototypes = int(P1.size(0))
+    core_v1 = self._select_per_proto_core_mask(min_d1_t_sq, k1_t, num_prototypes)
+    core_v2 = self._select_per_proto_core_mask(min_d2_t_sq, k2_t, num_prototypes)
+    joint_core = core_v1 & core_v2
 
-    core_mask = torch.zeros_like(same_proto, dtype=torch.bool)
-    with torch.no_grad():
-        same_indices = torch.nonzero(same_proto, as_tuple=False).flatten()
-        ratio = min(max(float(getattr(self.config, "core_ratio_B", 0.5)), 0.0), 1.0)
-        if bool(has_prev) and ratio > 0.0 and int(same_indices.numel()) > 0:
-            core_count = max(1, int(np.ceil(float(same_indices.numel()) * ratio)))
-            core_count = min(core_count, int(same_indices.numel()))
-            order = torch.argsort(same_dist_score.detach()[same_indices], stable=True)
-            core_mask[same_indices[order[:core_count]]] = True
-
-    if bool(core_mask.any()):
-        selected_k = k[core_mask].long()
-        loss_core = 0.25 * (
-            torch.sum((H1_t[core_mask] - P1[selected_k]) ** 2, dim=1).mean()
-            + torch.sum((H2_t[core_mask] - P2[selected_k]) ** 2, dim=1).mean()
-            + torch.sum((H1_p[core_mask] - P1[selected_k]) ** 2, dim=1).mean()
-            + torch.sum((H2_p[core_mask] - P2[selected_k]) ** 2, dim=1).mean()
-        )
+    if bool(joint_core.any()):
+        selected_k1 = k1_t[joint_core].long()
+        selected_k2 = k2_t[joint_core].long()
+        loss_core_v1 = torch.sum((H1_t[joint_core] - P1[selected_k1]) ** 2, dim=1).mean()
+        loss_core_v2 = torch.sum((H2_t[joint_core] - P2[selected_k2]) ** 2, dim=1).mean()
+        loss_core = 0.5 * (loss_core_v1 + loss_core_v2)
     else:
-        selected_k = k.new_empty((0,), dtype=torch.long)
+        selected_k1 = k1_t.new_empty((0,), dtype=torch.long)
+        selected_k2 = k2_t.new_empty((0,), dtype=torch.long)
+        loss_core_v1 = H1_t.sum() * 0.0
+        loss_core_v2 = H2_t.sum() * 0.0
         loss_core = H1_t.sum() * 0.0
 
-    if bool(getattr(self.config, "distance_consistency_norm", False)):
-        eps = float(getattr(self.config, "robust_eps", 1e-6))
-
-        def _normalize_dist(dist: torch.Tensor) -> torch.Tensor:
-            return dist / dist.mean(dim=1, keepdim=True).clamp_min(eps)
-
-        D1_t_cv, D2_t_cv = _normalize_dist(D1_t), _normalize_dist(D2_t)
-        D1_p_cv, D2_p_cv = _normalize_dist(D1_p), _normalize_dist(D2_p)
+    use_radius = bool(getattr(self.config, "use_negative_boundary_radius", True))
+    negative_boundary_margin = float(getattr(self.config, "negative_boundary_margin", 0.1))
+    if use_radius and hasattr(self, "stage2_boundary_radii_v1") and hasattr(self, "stage2_boundary_radii_v2"):
+        radii_v1 = torch.as_tensor(self.stage2_boundary_radii_v1, device=x_t.device, dtype=H1_t.dtype)
+        radii_v2 = torch.as_tensor(self.stage2_boundary_radii_v2, device=x_t.device, dtype=H2_t.dtype)
+        target_v1 = radii_v1[k1_n] + negative_boundary_margin
+        target_v2 = radii_v2[k2_n] + negative_boundary_margin
     else:
-        D1_t_cv, D2_t_cv = D1_t, D2_t
-        D1_p_cv, D2_p_cv = D1_p, D2_p
-    loss_cv_t = F.mse_loss(D1_t_cv, D2_t_cv)
-    loss_cv_p = F.mse_loss(D1_p_cv, D2_p_cv)
-    loss_cv_dist = 0.5 * (loss_cv_t + loss_cv_p)
-
-    lambda_core_B = float(getattr(self.config, "lambda_core_B", getattr(self.config, "lambda_pull_B", 0.5)))
-    lambda_cv_B = float(getattr(self.config, "lambda_cv_B", getattr(self.config, "lambda_align_B", 0.05)))
+        fixed_margin = float(getattr(self.config, "stage2_injected_margin", getattr(self.config, "margin_anom", 1.0)))
+        target_v1 = torch.full_like(min_d1_n, fixed_margin)
+        target_v2 = torch.full_like(min_d2_n, fixed_margin)
+    loss_neg_v1 = F.relu(target_v1 - min_d1_n).pow(2).mean()
+    loss_neg_v2 = F.relu(target_v2 - min_d2_n).pow(2).mean()
+    loss_neg = 0.5 * (loss_neg_v1 + loss_neg_v2)
+    neg_boundary_active_ratio_v1 = (min_d1_n < target_v1).float().mean()
+    neg_boundary_active_ratio_v2 = (min_d2_n < target_v2).float().mean()
 
     loss = (
         float(getattr(self.config, "lambda_rec_B", 1.0)) * loss_rec
         + float(getattr(self.config, "lambda_ap_B", 0.2)) * loss_ap
-        + float(getattr(self.config, "lambda_out_B", getattr(self.config, "lambda_anom_B", 0.05))) * loss_out
-        + lambda_core_B * loss_core
-        + lambda_cv_B * loss_cv_dist
+        + float(getattr(self.config, "lambda_core_B", getattr(self.config, "lambda_pull_B", 0.5))) * loss_core
+        + float(getattr(self.config, "lambda_neg_B", getattr(self.config, "lambda_anom_B", 0.05))) * loss_neg
     )
-    same_dist_score_mean = (
-        same_dist_score[same_proto].mean()
-        if bool(same_proto.any())
-        else H1_t.sum() * 0.0
-    )
+    same_proto = k1_t == k2_t
     total_count = torch.as_tensor(float(x_t.size(0)), device=x_t.device, dtype=loss.dtype)
-    selected_core_count = core_mask.float().sum().to(dtype=loss.dtype)
-    core_count_per_proto = torch.bincount(
-        selected_k.detach(),
-        minlength=int(P1.size(0)),
+    joint_core_count = joint_core.float().sum().to(dtype=loss.dtype)
+    core_count_per_proto_v1 = torch.bincount(
+        selected_k1.detach(),
+        minlength=num_prototypes,
+    ).to(device=x_t.device, dtype=loss.dtype)
+    core_count_per_proto_v2 = torch.bincount(
+        selected_k2.detach(),
+        minlength=num_prototypes,
     ).to(device=x_t.device, dtype=loss.dtype)
     return loss, {
         "loss": loss,
+        "loss_B": loss,
         "loss_rec": loss_rec,
         "loss_ap": loss_ap,
-        "loss_out": loss_out,
+        "loss_ap_v1": loss_ap_v1,
+        "loss_ap_v2": loss_ap_v2,
         "loss_core": loss_core,
-        "loss_cv_dist": loss_cv_dist,
+        "loss_core_v1": loss_core_v1,
+        "loss_core_v2": loss_core_v2,
+        "loss_neg": loss_neg,
+        "loss_neg_v1": loss_neg_v1,
+        "loss_neg_v2": loss_neg_v2,
+        "ap_dist_v1_mean": ap_dist_v1.mean(),
+        "ap_dist_v2_mean": ap_dist_v2.mean(),
+        "ap_active_ratio_v1": ap_active_ratio_v1,
+        "ap_active_ratio_v2": ap_active_ratio_v2,
+        "stage2_ap_margin": torch.as_tensor(stage2_ap_margin, device=x_t.device, dtype=loss.dtype),
         "same_proto_ratio": same_proto.float().mean(),
-        "selected_core_count": selected_core_count,
+        "core_count": joint_core_count,
+        "joint_core_count": joint_core_count,
         "total_count": total_count,
-        "selected_core_ratio": selected_core_count / total_count.clamp_min(1.0),
-        "core_count_per_proto": core_count_per_proto,
-        "same_dist_score_mean": same_dist_score_mean,
-        "min_d_pos_mean": 0.5 * (min_d1_t.mean() + min_d2_t.mean()),
-        "min_d_neg_mean": 0.5 * (min_d1_n.mean() + min_d2_n.mean()),
-        "cv_dist_mean": loss_cv_dist.detach(),
+        "core_ratio": joint_core_count / total_count.clamp_min(1.0),
+        "core_count_per_proto_v1": core_count_per_proto_v1,
+        "core_count_per_proto_v2": core_count_per_proto_v2,
+        "normal_min_proto_dist_v1_mean": min_d1_t.mean(),
+        "normal_min_proto_dist_v2_mean": min_d2_t.mean(),
+        "neg_min_proto_dist_v1_mean": min_d1_n.mean(),
+        "neg_min_proto_dist_v2_mean": min_d2_n.mean(),
+        "neg_boundary_active_ratio_v1": neg_boundary_active_ratio_v1,
+        "neg_boundary_active_ratio_v2": neg_boundary_active_ratio_v2,
+        "prototype_min_dist_v1": torch.as_tensor(
+            _prototype_min_pairwise_distance(P1),
+            device=x_t.device,
+            dtype=loss.dtype,
+        ),
+        "prototype_min_dist_v2": torch.as_tensor(
+            _prototype_min_pairwise_distance(P2),
+            device=x_t.device,
+            dtype=loss.dtype,
+        ),
     }
 
 
@@ -835,23 +984,41 @@ def _run_stage2_b_epoch(
     total_epochs: int,
 ):
     self._set_stage2_train_phase("B")
+    self._refresh_stage2_boundary_radii()
     self.model.train()
     totals = {
         "loss": 0.0,
+        "loss_B": 0.0,
         "loss_rec": 0.0,
         "loss_ap": 0.0,
-        "loss_out": 0.0,
+        "loss_ap_v1": 0.0,
+        "loss_ap_v2": 0.0,
         "loss_core": 0.0,
-        "loss_cv_dist": 0.0,
+        "loss_core_v1": 0.0,
+        "loss_core_v2": 0.0,
+        "loss_neg": 0.0,
+        "loss_neg_v1": 0.0,
+        "loss_neg_v2": 0.0,
+        "ap_dist_v1_mean": 0.0,
+        "ap_dist_v2_mean": 0.0,
+        "ap_active_ratio_v1": 0.0,
+        "ap_active_ratio_v2": 0.0,
+        "stage2_ap_margin": 0.0,
         "same_proto_ratio": 0.0,
-        "same_dist_score_mean": 0.0,
-        "min_d_pos_mean": 0.0,
-        "min_d_neg_mean": 0.0,
-        "cv_dist_mean": 0.0,
+        "core_ratio": 0.0,
+        "normal_min_proto_dist_v1_mean": 0.0,
+        "normal_min_proto_dist_v2_mean": 0.0,
+        "neg_min_proto_dist_v1_mean": 0.0,
+        "neg_min_proto_dist_v2_mean": 0.0,
+        "neg_boundary_active_ratio_v1": 0.0,
+        "neg_boundary_active_ratio_v2": 0.0,
+        "prototype_min_dist_v1": 0.0,
+        "prototype_min_dist_v2": 0.0,
     }
-    selected_core_count_total = 0.0
+    joint_core_count_total = 0.0
     total_count = 0.0
-    core_count_per_proto_total = None
+    core_count_per_proto_v1_total = None
+    core_count_per_proto_v2_total = None
     progress = tqdm(
         loader,
         desc=f"Stage2-B R{round_idx} E{epoch_in_phase}",
@@ -865,49 +1032,86 @@ def _run_stage2_b_epoch(
         self.optimizer.step()
         for key in totals:
             value = float(metrics[key].item())
-            if key in {"same_proto_ratio", "same_dist_score_mean", "min_d_pos_mean", "min_d_neg_mean"}:
+            if key in {
+                "same_proto_ratio",
+                "core_ratio",
+                "normal_min_proto_dist_v1_mean",
+                "normal_min_proto_dist_v2_mean",
+                "neg_min_proto_dist_v1_mean",
+                "neg_min_proto_dist_v2_mean",
+                "neg_boundary_active_ratio_v1",
+                "neg_boundary_active_ratio_v2",
+            }:
                 value *= float(metrics["total_count"].item())
             totals[key] += value
-        batch_core_count = float(metrics["selected_core_count"].item())
+        batch_core_count = float(metrics["joint_core_count"].item())
         batch_total_count = float(metrics["total_count"].item())
-        selected_core_count_total += batch_core_count
+        joint_core_count_total += batch_core_count
         total_count += batch_total_count
-        batch_core_count_per_proto = metrics["core_count_per_proto"].detach().cpu().numpy().astype(np.int64)
-        if core_count_per_proto_total is None:
-            core_count_per_proto_total = np.zeros_like(batch_core_count_per_proto, dtype=np.int64)
-        core_count_per_proto_total += batch_core_count_per_proto
+        batch_core_count_per_proto_v1 = metrics["core_count_per_proto_v1"].detach().cpu().numpy().astype(np.int64)
+        batch_core_count_per_proto_v2 = metrics["core_count_per_proto_v2"].detach().cpu().numpy().astype(np.int64)
+        if core_count_per_proto_v1_total is None:
+            core_count_per_proto_v1_total = np.zeros_like(batch_core_count_per_proto_v1, dtype=np.int64)
+            core_count_per_proto_v2_total = np.zeros_like(batch_core_count_per_proto_v2, dtype=np.int64)
+        core_count_per_proto_v1_total += batch_core_count_per_proto_v1
+        core_count_per_proto_v2_total += batch_core_count_per_proto_v2
         progress.set_postfix(
             {
                 "loss": f"{loss.item():.4f}",
                 "rec": f"{metrics['loss_rec'].item():.4f}",
                 "ap": f"{metrics['loss_ap'].item():.4f}",
-                "out": f"{metrics['loss_out'].item():.4f}",
+                "neg": f"{metrics['loss_neg'].item():.4f}",
                 "core": f"{metrics['loss_core'].item():.4f}",
-                "cv": f"{metrics['loss_cv_dist'].item():.4f}",
             }
         )
     denom = max(1, len(loader))
     sample_denom = max(1.0, total_count)
     logs = {key: value / denom for key, value in totals.items()}
-    for key in {"same_proto_ratio", "same_dist_score_mean", "min_d_pos_mean", "min_d_neg_mean"}:
+    for key in {
+        "same_proto_ratio",
+        "core_ratio",
+        "normal_min_proto_dist_v1_mean",
+        "normal_min_proto_dist_v2_mean",
+        "neg_min_proto_dist_v1_mean",
+        "neg_min_proto_dist_v2_mean",
+        "neg_boundary_active_ratio_v1",
+        "neg_boundary_active_ratio_v2",
+    }:
         logs[key] = totals[key] / sample_denom
-    logs["selected_core_count"] = int(selected_core_count_total)
+    logs["core_count"] = int(joint_core_count_total)
+    logs["joint_core_count"] = int(joint_core_count_total)
     logs["total_count"] = int(total_count)
-    logs["selected_core_ratio"] = selected_core_count_total / sample_denom
+    logs["core_ratio"] = joint_core_count_total / sample_denom
+    radii_v1 = np.asarray(getattr(self, "stage2_boundary_radii_v1", np.empty(0)), dtype=np.float32)
+    radii_v2 = np.asarray(getattr(self, "stage2_boundary_radii_v2", np.empty(0)), dtype=np.float32)
+    if radii_v1.size:
+        logs.update(
+            {
+                "radius_v1_mean": float(np.mean(radii_v1)),
+                "radius_v1_min": float(np.min(radii_v1)),
+                "radius_v1_max": float(np.max(radii_v1)),
+            }
+        )
+    if radii_v2.size:
+        logs.update(
+            {
+                "radius_v2_mean": float(np.mean(radii_v2)),
+                "radius_v2_min": float(np.min(radii_v2)),
+                "radius_v2_max": float(np.max(radii_v2)),
+            }
+        )
     self._log_epoch(
         "Stage2-B",
         global_epoch,
         total_epochs,
         logs,
     )
-    core_count_list = (
-        core_count_per_proto_total.astype(int).tolist()
-        if core_count_per_proto_total is not None
-        else []
-    )
     print(
         f"[Stage2-B] Epoch {global_epoch}/{total_epochs} | "
-        f"core_count_per_proto: {core_count_list}"
+        f"core_count_per_proto_v1: "
+        f"{(core_count_per_proto_v1_total.astype(int).tolist() if core_count_per_proto_v1_total is not None else [])} | "
+        f"core_count_per_proto_v2: "
+        f"{(core_count_per_proto_v2_total.astype(int).tolist() if core_count_per_proto_v2_total is not None else [])}"
     )
 
 
@@ -951,37 +1155,20 @@ def _refresh_aligned_stage2_state(self, round_idx: int):
     arrays = {key: np.concatenate(values, axis=0) for key, values in collected.items()}
     centers_v1 = self.model.prototype_head_v1.prototypes.detach().cpu().numpy().astype(np.float32)
     centers_v2 = self.model.prototype_head_v2.prototypes.detach().cpu().numpy().astype(np.float32)
-    centers = (0.5 * (centers_v1 + centers_v2)).astype(np.float32)
-    q_avg = 0.5 * (arrays["q1"] + arrays["q2"])
-    labels = np.argmax(q_avg, axis=1).astype(np.int64)
-    avg_features = 0.5 * (arrays["h1"].astype(np.float32) + arrays["h2"].astype(np.float32))
+    centers = centers_v1
+    labels = arrays["pred1"].astype(np.int64)
     core_mask = np.ones(labels.shape[0], dtype=bool)
-    score_core = (0.5 * (arrays["dist1"] + arrays["dist2"])).astype(np.float32)
-    final_a_dist_score = 0.5 * (
-        np.square(arrays["dist1"].astype(np.float32))
-        + np.square(arrays["dist2"].astype(np.float32))
-    )
-    final_a_align_score = np.mean(
-        np.square(arrays["q1"].astype(np.float32) - arrays["q2"].astype(np.float32)),
-        axis=1,
-    ).astype(np.float32)
-    final_a_recon_score = 0.5 * (
-        arrays["recon1"].astype(np.float32)
-        + arrays["recon2"].astype(np.float32)
-    )
-    final_a_score = (
-        float(getattr(self.config, "alpha_A", 1.0)) * final_a_dist_score
-        + float(getattr(self.config, "beta_A", 1.0)) * final_a_align_score
-        + float(getattr(self.config, "gamma_A", 0.5)) * final_a_recon_score
-    ).astype(np.float32)
+    score_core = arrays["dist1"].astype(np.float32)
+    final_a_score_v1 = np.square(arrays["dist1"].astype(np.float32))
+    final_a_score_v2 = np.square(arrays["dist2"].astype(np.float32))
     num_prototypes = int(centers_v1.shape[0])
     final_a_core_mask_v1 = self._select_a_core_mask_by_proto(
-        torch.from_numpy(final_a_score),
+        torch.from_numpy(final_a_score_v1),
         torch.from_numpy(arrays["pred1"].astype(np.int64)),
         num_prototypes,
     ).cpu().numpy().astype(bool)
     final_a_core_mask_v2 = self._select_a_core_mask_by_proto(
-        torch.from_numpy(final_a_score),
+        torch.from_numpy(final_a_score_v2),
         torch.from_numpy(arrays["pred2"].astype(np.int64)),
         num_prototypes,
     ).cpu().numpy().astype(bool)
@@ -1002,12 +1189,9 @@ def _refresh_aligned_stage2_state(self, round_idx: int):
     valid_active = (active_indices >= 0) & (active_indices < full_train_count)
     final_a_core_mask_v1_full[active_indices[valid_active]] = final_a_core_mask_v1[valid_active]
     final_a_core_mask_v2_full[active_indices[valid_active]] = final_a_core_mask_v2[valid_active]
-    radii = _cluster_boundary_radii(
-        avg_features,
-        labels,
-        centers,
-        eps=float(getattr(self.config, "robust_eps", 1e-6)),
-    )
+    radii_v1, counts_v1 = self._per_proto_radius_quantiles(arrays["pred1"], arrays["dist1"], num_prototypes)
+    radii_v2, counts_v2 = self._per_proto_radius_quantiles(arrays["pred2"], arrays["dist2"], num_prototypes)
+    radii = radii_v1
     global_center = centers.mean(axis=0).astype(np.float32)
     nearest_other = _nearest_other_clusters(centers)
     summary = [
@@ -1025,11 +1209,13 @@ def _refresh_aligned_stage2_state(self, round_idx: int):
         "cluster_labels": labels,
         "core_mask": core_mask,
         "cluster_radii": radii,
+        "cluster_radii_v1": radii_v1,
+        "cluster_radii_v2": radii_v2,
         "global_center": global_center,
         "nearest_other_cluster": nearest_other,
         "score_core": score_core,
         "refresh_round": int(round_idx),
-        "bank_mode": "stage2_ab_aligned_local_window",
+        "bank_mode": "stage2_ab_proto_no_view_align_local_window",
         "bank_summary": summary,
         "proto_conf1": arrays["conf1"].astype(np.float32),
         "proto_conf2": arrays["conf2"].astype(np.float32),
@@ -1039,7 +1225,8 @@ def _refresh_aligned_stage2_state(self, round_idx: int):
         "proto_dist2": arrays["dist2"].astype(np.float32),
         "recon1": arrays["recon1"].astype(np.float32),
         "recon2": arrays["recon2"].astype(np.float32),
-        "final_a_score": final_a_score,
+        "final_a_score_v1": final_a_score_v1,
+        "final_a_score_v2": final_a_score_v2,
         "final_a_core_mask_v1": final_a_core_mask_v1,
         "final_a_core_mask_v2": final_a_core_mask_v2,
         "final_a_core_mask_v1_full": final_a_core_mask_v1_full,
@@ -1047,10 +1234,13 @@ def _refresh_aligned_stage2_state(self, round_idx: int):
     }
     self._apply_cluster_bank(state)
     print(
-        "[Stage2] refreshed aligned prototype state | "
+        "[Stage2] refreshed independent prototype state | "
         f"round={int(round_idx)} | "
         f"samples={int(labels.shape[0])} | "
-        f"mean_proto_score={float(np.mean(score_core)):.6f} | "
+        f"mean_proto_score_v1={float(np.mean(arrays['dist1'])):.6f} | "
+        f"mean_proto_score_v2={float(np.mean(arrays['dist2'])):.6f} | "
+        f"assign_v1={counts_v1.astype(int).tolist()} | "
+        f"assign_v2={counts_v2.astype(int).tolist()} | "
         f"final_a_core_v1={int(final_a_core_mask_v1.sum())} | "
         f"final_a_core_v2={int(final_a_core_mask_v2.sum())}"
     )

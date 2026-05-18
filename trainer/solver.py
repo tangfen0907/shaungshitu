@@ -109,6 +109,7 @@ class Solver:
             num_workers=self._effective_num_workers(),
             drop_last=False,
             pin_memory=self._pin_memory(),
+            generator=self._make_loader_generator(103),
         )
 
         self._align_config_with_data()
@@ -182,6 +183,11 @@ class Solver:
 
     def _pin_memory(self) -> bool:
         return self.device.type == "cuda" and bool(getattr(self.config, "pin_memory", True))
+
+    def _make_loader_generator(self, seed_offset: int = 0) -> torch.Generator:
+        generator = torch.Generator()
+        generator.manual_seed(int(self.config.seed) + int(seed_offset))
+        return generator
 
     @staticmethod
     def _set_random_seed(seed: int):
@@ -300,6 +306,7 @@ class Solver:
             dataset=self.config.dataset,
             cache_windows=bool(getattr(self.config, "cache_windows", False)),
             pin_memory=self._pin_memory(),
+            generator=self._make_loader_generator(101),
             **loader_kwargs,
         )
         test_loader = get_loader_segment(
@@ -312,6 +319,7 @@ class Solver:
             dataset=self.config.dataset,
             cache_windows=bool(getattr(self.config, "cache_windows", False)),
             pin_memory=self._pin_memory(),
+            generator=self._make_loader_generator(102),
             **loader_kwargs,
         )
         if train_split_mode.lower() != "train":
@@ -546,10 +554,11 @@ class Solver:
         z_positive: torch.Tensor,
         z_negative: torch.Tensor,
     ) -> torch.Tensor:
-        d_ap_sq = torch.sum((z_anchor - z_positive) ** 2, dim=1)
+        d_ap = torch.sqrt(torch.sum((z_anchor - z_positive) ** 2, dim=1) + 1e-12)
         d_an = torch.sqrt(torch.sum((z_anchor - z_negative) ** 2, dim=1) + 1e-12)
+        ap_margin = float(getattr(self.config, "stage1_ap_margin", 0.1))
         margin = float(getattr(self.config, "stage1_triplet_margin", 0.3))
-        return (d_ap_sq + torch.relu(margin - d_an) ** 2).mean()
+        return (torch.relu(d_ap - ap_margin) ** 2 + torch.relu(margin - d_an) ** 2).mean()
 
     def _is_dual_view_model(self) -> bool:
         return bool(getattr(self.model, "is_dual_view", False))

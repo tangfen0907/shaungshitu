@@ -11,6 +11,7 @@ from metrics.Matthews_correlation_coefficient import MCC
 from metrics.affiliation.generics import convert_vector_to_events
 from metrics.affiliation.metrics import pr_from_events
 from metrics.f1_score_f1_pa import get_adjust_F1PA
+from trainer.stage2 import _prototype_min_pairwise_distance
 from utils.scoring import (
     compute_separate_proto_component_scores,
     previous_indices_from_point_indices,
@@ -897,8 +898,12 @@ def _test_dual_separate_proto(self):
         train_outputs["recon2"],
         train_outputs["q1"],
         train_outputs["q2"],
+        h1=train_outputs["u1"],
+        h2=train_outputs["u2"],
         q1_prev=train_outputs["q1"][train_prev],
         q2_prev=train_outputs["q2"][train_prev],
+        h1_prev=train_outputs["u1"][train_prev],
+        h2_prev=train_outputs["u2"][train_prev],
         eps=eps,
     )
     components = compute_separate_proto_component_scores(
@@ -908,8 +913,12 @@ def _test_dual_separate_proto(self):
         test_outputs["recon2"],
         test_outputs["q1"],
         test_outputs["q2"],
+        h1=test_outputs["u1"],
+        h2=test_outputs["u2"],
         q1_prev=test_outputs["q1"][test_prev],
         q2_prev=test_outputs["q2"][test_prev],
+        h1_prev=test_outputs["u1"][test_prev],
+        h2_prev=test_outputs["u2"][test_prev],
         eps=eps,
     )
 
@@ -921,13 +930,72 @@ def _test_dual_separate_proto(self):
     )
     distance_analysis = self._analyze_test_latent_distances(test_outputs["u_joint"], y_true)
     proto_head = self.model.prototype_head_v1
+    num_prototypes = int(getattr(proto_head, "num_prototypes", 0))
+
+    def _dist_summary(values: np.ndarray) -> str:
+        values = np.asarray(values, dtype=np.float32).reshape(-1)
+        if values.size == 0:
+            return "n=0"
+        return (
+            f"n={int(values.size)},mean={float(np.mean(values)):.6f},"
+            f"q50={float(np.quantile(values, 0.50)):.6f},"
+            f"q95={float(np.quantile(values, 0.95)):.6f}"
+        )
+
+    train_assign_v1 = np.bincount(train_outputs["pred1"].astype(np.int64), minlength=num_prototypes).astype(int).tolist()
+    train_assign_v2 = np.bincount(train_outputs["pred2"].astype(np.int64), minlength=num_prototypes).astype(int).tolist()
+    test_assign_v1 = np.bincount(test_outputs["pred1"].astype(np.int64), minlength=num_prototypes).astype(int).tolist()
+    test_assign_v2 = np.bincount(test_outputs["pred2"].astype(np.int64), minlength=num_prototypes).astype(int).tolist()
+    same_proto_ratio = float(np.mean(test_outputs["pred1"] == test_outputs["pred2"]))
+    print(
+        "[Test][PrototypeDiagnostics] assignment counts | "
+        f"train_v1={train_assign_v1} | train_v2={train_assign_v2} | "
+        f"test_v1={test_assign_v1} | test_v2={test_assign_v2}"
+    )
+    print(
+        "[Test][PrototypeDiagnostics] min pairwise distance | "
+        f"view1={_prototype_min_pairwise_distance(self.model.prototype_head_v1.prototypes.detach()):.6f} | "
+        f"view2={_prototype_min_pairwise_distance(self.model.prototype_head_v2.prototypes.detach()):.6f} | "
+        f"same_proto_ratio={same_proto_ratio:.6f}"
+    )
+    print(
+        "[Test][PrototypeDiagnostics] min-prototype distance | "
+        f"test_v1={_dist_summary(test_outputs['proto_dist1'])} | "
+        f"test_v2={_dist_summary(test_outputs['proto_dist2'])} | "
+        f"normal_v1={_dist_summary(test_outputs['proto_dist1'][y_true == 0])} | "
+        f"normal_v2={_dist_summary(test_outputs['proto_dist2'][y_true == 0])} | "
+        f"anomaly_v1={_dist_summary(test_outputs['proto_dist1'][y_true == 1])} | "
+        f"anomaly_v2={_dist_summary(test_outputs['proto_dist2'][y_true == 1])}"
+    )
+    state = self.stage2_structure if isinstance(self.stage2_structure, dict) else {}
+    final_a_core_v1 = np.asarray(state.get("final_a_core_mask_v1", np.empty(0)), dtype=bool)
+    final_a_core_v2 = np.asarray(state.get("final_a_core_mask_v2", np.empty(0)), dtype=bool)
+    pred1_state = np.asarray(state.get("proto_pred1", np.empty(0)), dtype=np.int64)
+    pred2_state = np.asarray(state.get("proto_pred2", np.empty(0)), dtype=np.int64)
+    if final_a_core_v1.size and pred1_state.size == final_a_core_v1.size:
+        core_count_v1 = np.bincount(pred1_state[final_a_core_v1], minlength=num_prototypes).astype(int).tolist()
+    else:
+        core_count_v1 = []
+    if final_a_core_v2.size and pred2_state.size == final_a_core_v2.size:
+        core_count_v2 = np.bincount(pred2_state[final_a_core_v2], minlength=num_prototypes).astype(int).tolist()
+    else:
+        core_count_v2 = []
+    radii_v1 = np.asarray(state.get("cluster_radii_v1", np.empty(0)), dtype=np.float32).reshape(-1)
+    radii_v2 = np.asarray(state.get("cluster_radii_v2", np.empty(0)), dtype=np.float32).reshape(-1)
+    print(
+        "[Test][PrototypeDiagnostics] core/radius | "
+        f"core_count_per_proto_v1={core_count_v1} | "
+        f"core_count_per_proto_v2={core_count_v2} | "
+        f"radius_v1={(np.round(radii_v1, 6).tolist() if radii_v1.size else [])} | "
+        f"radius_v2={(np.round(radii_v2, 6).tolist() if radii_v2.size else [])}"
+    )
 
     print(
         f"{family_label} component scoring: "
         "no fused score emitted | "
         "scores=score_recon_v1,score_recon_v2,score_proto_v1,score_proto_v2,"
-        "score_dist_gap,score_cross_view_js,score_temporal_js | "
-        f"K={int(getattr(proto_head, 'num_prototypes', 0))} | "
+        "score_proto_ap_gap_v1,score_proto_ap_gap_v2,score_proto_ap_gap_sum | "
+        f"K={num_prototypes} | "
         f"state_dim={int(getattr(self.model, 'state_dim', 0))}"
     )
 
@@ -955,9 +1023,9 @@ def _test_dual_separate_proto(self):
         ("score_recon_v2", f"{family_label}ScoreReconV2"),
         ("score_proto_v1", f"{family_label}ScoreProtoV1"),
         ("score_proto_v2", f"{family_label}ScoreProtoV2"),
-        ("score_dist_gap", f"{family_label}ScoreDistGap"),
-        ("score_cross_view_js", f"{family_label}ScoreCrossViewJS"),
-        ("score_temporal_js", f"{family_label}ScoreTemporalJS"),
+        ("score_proto_ap_gap_v1", f"{family_label}ScoreProtoAPGapV1"),
+        ("score_proto_ap_gap_v2", f"{family_label}ScoreProtoAPGapV2"),
+        ("score_proto_ap_gap_sum", f"{family_label}ScoreProtoAPGapSum"),
     ]
     component_families = {}
     for score_key, score_label in score_specs:

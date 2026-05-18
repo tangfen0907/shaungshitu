@@ -130,9 +130,9 @@ def print_score_family_results(results: dict):
         ("score_recon_v2", "score_recon_v2: View2 reconstruction score"),
         ("score_proto_v1", "score_proto_v1: View1 nearest-prototype squared distance"),
         ("score_proto_v2", "score_proto_v2: View2 nearest-prototype squared distance"),
-        ("score_dist_gap", "score_dist_gap: normalized full-distance-vector gap"),
-        ("score_cross_view_js", "score_cross_view_js: JS(A1,A2)+JS(B1,B2)"),
-        ("score_temporal_js", "score_temporal_js: JS(A1,B1)+JS(A2,B2)"),
+        ("score_proto_ap_gap_v1", "score_proto_ap_gap_v1: max(0, d_proto_v1 - d_ap_v1)"),
+        ("score_proto_ap_gap_v2", "score_proto_ap_gap_v2: max(0, d_proto_v2 - d_ap_v2)"),
+        ("score_proto_ap_gap_sum", "score_proto_ap_gap_sum: view1 + view2 proto/AP gaps"),
     ]
     component_families = results.get("component_families", {})
     for key, label in separated_labels:
@@ -276,9 +276,10 @@ def print_train_summary(config: Config, run_dir: str, run_name: str, experiment_
         "mode=full_recon+local_window_APN | "
         f"context_len={getattr(config, 'stage1_inject_context_len', 0) or getattr(config, 'seq_len', 20)} | "
         "positive=X_t_minus_1 | "
-        "geometry=raw_l2_squared | "
+        "geometry=small_margin_AP_hinge | "
         f"lambda_triplet={getattr(config, 'lambda_stage1_triplet', 1.0)} | "
-        f"lambda_cv={getattr(config, 'lambda_cv_stage1', 0.2)} | "
+        f"ap_margin={getattr(config, 'stage1_ap_margin', 0.1)} | "
+        "lambda_cv=off | "
         f"triplet_margin={getattr(config, 'stage1_triplet_margin', 0.3)}"
     )
     print(
@@ -293,21 +294,17 @@ def print_train_summary(config: Config, run_dir: str, run_name: str, experiment_
         f"active_pool_trim={getattr(config, 'active_pool_trim_enabled', False)} "
         f"(stage0={getattr(config, 'active_pool_trim_stage0_ratio', 0.0)}, "
         f"stage1={getattr(config, 'active_pool_trim_stage1_ratio', 0.0)}) | "
-        "A=prototype_refresh_no_optimizer"
+        "A=prototype_only_pull+separation"
     )
     print(
         "Loss/Score: "
-        f"A=(core={getattr(config, 'core_ratio_A', 0.3)}, "
-        f"alpha={getattr(config, 'alpha_A', 1.0)}, "
-        f"beta={getattr(config, 'beta_A', 1.0)}, "
-        f"gamma={getattr(config, 'gamma_A', 0.5)}, "
-        f"momentum={getattr(config, 'proto_momentum', 0.8)}, "
-        f"pair_align={getattr(config, 'pair_align_strength', 0.2)}) | "
+        f"A=(pull={getattr(config, 'lambda_pull_A', 1.0)}, "
+        f"sep={getattr(config, 'lambda_sep_A', 0.1)}) | "
         f"B=(rec={getattr(config, 'lambda_rec_B', 1.0)}, "
-        f"pull={getattr(config, 'lambda_pull_B', 0.5)}, "
-        f"align={getattr(config, 'lambda_align_B', 0.05)}, "
-        "delta=off, "
-        f"anom={getattr(config, 'lambda_anom_B', 0.05)}) | "
+        f"ap={getattr(config, 'lambda_ap_B', 0.2)}, "
+        f"core={getattr(config, 'lambda_core_B', getattr(config, 'lambda_pull_B', 0.5))}, "
+        f"neg={getattr(config, 'lambda_neg_B', getattr(config, 'lambda_anom_B', 0.05))}, "
+        f"boundary_q={getattr(config, 'boundary_quantile', 0.95)}) | "
         f"js={getattr(config, 'lambda_js_score', 1.0)} | "
         f"proto_recon={getattr(config, 'prototype_recon_weight', 0.5)} | "
         f"threshold_q={config.decision_quantile}"

@@ -35,7 +35,7 @@ def build_common_preset_overrides(
     overrides = dict(local_overrides)
     json_overrides = load_json_overrides(getattr(args, "config_json", ""))
     if json_overrides:
-        overrides = merge_configs(overrides, json_overrides)
+        overrides.update(json_overrides)
 
     cli_overrides = _collect_cli_overrides(args, TRAIN_OVERRIDE_KEYS)
     for key in (
@@ -52,7 +52,7 @@ def build_common_preset_overrides(
         if key in cli_overrides and isinstance(cli_overrides[key], str):
             cli_overrides[key] = cli_overrides[key].strip().lower()
     if cli_overrides:
-        overrides = merge_configs(overrides, cli_overrides)
+        overrides.update(cli_overrides)
     return overrides
 
 
@@ -165,6 +165,7 @@ TRAIN_OVERRIDE_KEYS = [
     "stage1_inject_context_len",
     "lambda_stage1_triplet",
     "lambda_cv_stage1",
+    "stage1_ap_margin",
     "stage1_triplet_margin",
     "num_stage2_rounds",
     "epochs_per_stage2_round",
@@ -186,10 +187,18 @@ TRAIN_OVERRIDE_KEYS = [
     "beta_B",
     "gamma_B",
     "lambda_rec_B",
+    "lambda_ap_B",
+    "lambda_core_B",
+    "lambda_neg_B",
     "lambda_pull_B",
     "lambda_align_B",
+    "lambda_cv_B",
     "lambda_delta_B",
     "lambda_anom_B",
+    "stage2_ap_margin",
+    "boundary_quantile",
+    "negative_boundary_margin",
+    "use_negative_boundary_radius",
     "margin_anom",
     "stage2_lambda_rec",
     "decision_quantile",
@@ -312,6 +321,7 @@ def build_parser(
     parser.add_argument("--stage1_inject_context_len", type=int, default=None)
     parser.add_argument("--lambda_stage1_triplet", type=float, default=None)
     parser.add_argument("--lambda_cv_stage1", type=float, default=None)
+    parser.add_argument("--stage1_ap_margin", type=float, default=None)
     parser.add_argument("--stage1_triplet_margin", type=float, default=None)
 
     parser.add_argument("--num_stage2_rounds", type=int, default=None)
@@ -334,10 +344,18 @@ def build_parser(
     parser.add_argument("--beta_B", type=float, default=None)
     parser.add_argument("--gamma_B", type=float, default=None)
     parser.add_argument("--lambda_rec_B", type=float, default=None)
+    parser.add_argument("--lambda_ap_B", type=float, default=None)
+    parser.add_argument("--lambda_core_B", type=float, default=None)
+    parser.add_argument("--lambda_neg_B", type=float, default=None)
     parser.add_argument("--lambda_pull_B", type=float, default=None)
     parser.add_argument("--lambda_align_B", type=float, default=None)
+    parser.add_argument("--lambda_cv_B", type=float, default=None)
     parser.add_argument("--lambda_delta_B", type=float, default=None)
     parser.add_argument("--lambda_anom_B", type=float, default=None)
+    parser.add_argument("--stage2_ap_margin", type=float, default=None)
+    parser.add_argument("--boundary_quantile", type=float, default=None)
+    parser.add_argument("--negative_boundary_margin", type=float, default=None)
+    parser.add_argument("--use_negative_boundary_radius", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--margin_anom", type=float, default=None)
     parser.add_argument("--stage2_lambda_rec", type=float, default=None)
     parser.add_argument("--decision_quantile", type=float, default=None)

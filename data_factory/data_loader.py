@@ -775,6 +775,7 @@ def get_loader_segment(
     cache_windows=False,
     left_pad_windows=False,
     pin_memory=False,
+    generator=None,
 ):
     effective_step = max(1, int(step))
     # Most legacy presets were reported with dense windows. SMAP can opt into
@@ -833,5 +834,6 @@ def get_loader_segment(
                              shuffle=shuffle,
                              num_workers=0,
                              drop_last=False,
-                             pin_memory=bool(pin_memory))
+                             pin_memory=bool(pin_memory),
+                             generator=generator)
     return data_loader

@@ -120,7 +120,8 @@ class Config:
     stage1_inject_context_len: int = 0
     stage1_negative_chunk_size: int = 1024
     lambda_stage1_triplet: float = 1.0
-    lambda_cv_stage1: float = 0.2
+    lambda_cv_stage1: float = 0.0
+    stage1_ap_margin: float = 0.1
     stage1_triplet_margin: float = 0.3
     stage2_inject_context_len: int = 0
     core_ratio_A: float = 0.3
@@ -130,20 +131,29 @@ class Config:
     proto_momentum: float = 0.8
     pair_align_strength: float = 0.2
     min_core_per_proto: int = 1
-    # Legacy knobs retained for checkpoint/config compatibility; Stage2-A no
-    # longer uses gradient pull/separation/pair losses.
+    # Legacy knobs are retained for checkpoint/config compatibility. The
+    # proto-no-view-align route uses pull/separation only; pair alignment is
+    # diagnostic-only and never contributes to the objective.
     lambda_pull_A: float = 1.0
     lambda_sep_A: float = 0.1
-    lambda_pair_A: float = 0.1
+    lambda_pair_A: float = 0.0
     core_ratio_B: float = 0.5
     alpha_B: float = 1.0
     beta_B: float = 1.0
     gamma_B: float = 0.0
     lambda_rec_B: float = 1.0
+    lambda_ap_B: float = 0.2
+    lambda_core_B: float = 0.5
+    lambda_neg_B: float = 0.05
     lambda_pull_B: float = 0.5
-    lambda_align_B: float = 0.05
+    lambda_align_B: float = 0.0
+    lambda_cv_B: float = 0.0
     lambda_delta_B: float = 0.0
     lambda_anom_B: float = 0.05
+    stage2_ap_margin: float = 0.1
+    boundary_quantile: float = 0.95
+    negative_boundary_margin: float = 0.1
+    use_negative_boundary_radius: bool = True
     margin_anom: float = 1.0
     negative_injection_profile: str = "default"
     stage2_relational_negative_p: float = 0.0
@@ -261,7 +271,8 @@ _COMMON_EXPLICIT: Dict[str, object] = {
     "stage1_inject_context_len": 0,
     "stage1_negative_chunk_size": 1024,
     "lambda_stage1_triplet": 1.0,
-    "lambda_cv_stage1": 0.2,
+    "lambda_cv_stage1": 0.0,
+    "stage1_ap_margin": 0.1,
     "stage1_triplet_margin": 0.3,
     "stage2_inject_context_len": 0,
     "core_ratio_A": 0.3,
@@ -273,16 +284,24 @@ _COMMON_EXPLICIT: Dict[str, object] = {
     "min_core_per_proto": 1,
     "lambda_pull_A": 1.0,
     "lambda_sep_A": 0.1,
-    "lambda_pair_A": 0.1,
+    "lambda_pair_A": 0.0,
     "core_ratio_B": 0.5,
     "alpha_B": 1.0,
     "beta_B": 1.0,
     "gamma_B": 0.0,
     "lambda_rec_B": 1.0,
+    "lambda_ap_B": 0.2,
+    "lambda_core_B": 0.5,
+    "lambda_neg_B": 0.05,
     "lambda_pull_B": 0.5,
-    "lambda_align_B": 0.05,
+    "lambda_align_B": 0.0,
+    "lambda_cv_B": 0.0,
     "lambda_delta_B": 0.0,
     "lambda_anom_B": 0.05,
+    "stage2_ap_margin": 0.1,
+    "boundary_quantile": 0.95,
+    "negative_boundary_margin": 0.1,
+    "use_negative_boundary_radius": True,
     "margin_anom": 1.0,
     "negative_injection_profile": "default",
     "stage2_relational_negative_p": 0.0,
@@ -495,16 +514,24 @@ _STAGE2_METHOD_DEFAULTS: Dict[str, Dict[str, object]] = {
         "min_core_per_proto": 1,
         "lambda_pull_A": 1.0,
         "lambda_sep_A": 0.1,
-        "lambda_pair_A": 0.1,
+        "lambda_pair_A": 0.0,
         "core_ratio_B": 0.5,
         "alpha_B": 1.0,
         "beta_B": 1.0,
         "gamma_B": 0.0,
         "lambda_rec_B": 1.0,
+        "lambda_ap_B": 0.2,
+        "lambda_core_B": 0.5,
+        "lambda_neg_B": 0.05,
         "lambda_pull_B": 0.5,
-        "lambda_align_B": 0.05,
+        "lambda_align_B": 0.0,
+        "lambda_cv_B": 0.0,
         "lambda_delta_B": 0.0,
         "lambda_anom_B": 0.05,
+        "stage2_ap_margin": 0.1,
+        "boundary_quantile": 0.95,
+        "negative_boundary_margin": 0.1,
+        "use_negative_boundary_radius": True,
         "margin_anom": 1.0,
     },
 }

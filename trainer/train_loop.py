@@ -35,11 +35,12 @@ def run_train_loop(solver):
         "reconstruction=current_point | "
         "negative=inject_local_L_window | "
         "positive=X_t_minus_1 | "
-        "geometry=raw_l2_squared | "
+        "geometry=small_margin_AP_hinge+negative_boundary_hinge | "
         "away=absolute_margin | "
         f"context_len={self._inject_context_len('stage1')} | "
         f"lambda_triplet={float(getattr(self.config, 'lambda_stage1_triplet', 1.0)):.3f} | "
-        f"lambda_cv={float(getattr(self.config, 'lambda_cv_stage1', 0.2)):.3f} | "
+        f"ap_margin={float(getattr(self.config, 'stage1_ap_margin', 0.1)):.3f} | "
+        "lambda_cv=off | "
         f"triplet_margin={float(getattr(self.config, 'stage1_triplet_margin', 0.3)):.3f}"
     )
     if self._is_dual_view_model():
@@ -91,20 +92,16 @@ def run_train_loop(solver):
         f"num_prototypes={int(getattr(self.config, 'num_prototypes', 0))} | "
         f"state_dim={int(getattr(self.config, 'state_dim', 0))} | "
         f"active_pool={self._active_pool_summary_text()} | "
-        f"A=(core={float(getattr(self.config, 'core_ratio_A', 0.5)):.3f}, "
-        f"proto_momentum={float(getattr(self.config, 'proto_momentum', 0.8)):.3f}, "
-        f"pair_align_strength={float(getattr(self.config, 'pair_align_strength', 0.2)):.3f}, "
-        f"alpha={float(getattr(self.config, 'alpha_A', 1.0)):.3f}, "
-        f"beta={float(getattr(self.config, 'beta_A', 1.0)):.3f}, "
-        f"gamma={float(getattr(self.config, 'gamma_A', 0.5)):.3f}) | "
+        f"A=(pull={float(getattr(self.config, 'lambda_pull_A', 1.0)):.3f}, "
+        f"sep={float(getattr(self.config, 'lambda_sep_A', 0.1)):.3f}) | "
         f"B=(core={float(getattr(self.config, 'core_ratio_B', 0.5)):.3f}, "
         f"rec={float(getattr(self.config, 'lambda_rec_B', 1.0)):.3f}, "
-        f"pull={float(getattr(self.config, 'lambda_pull_B', 0.5)):.3f}, "
-        f"align={float(getattr(self.config, 'lambda_align_B', 0.05)):.3f}, "
-        "delta=off, "
-        f"anom={float(getattr(self.config, 'lambda_anom_B', 0.05)):.3f})"
+        f"ap={float(getattr(self.config, 'lambda_ap_B', 0.2)):.3f}, "
+        f"core_pull={float(getattr(self.config, 'lambda_core_B', getattr(self.config, 'lambda_pull_B', 0.5))):.3f}, "
+        f"neg={float(getattr(self.config, 'lambda_neg_B', getattr(self.config, 'lambda_anom_B', 0.05))):.3f}, "
+        f"ap_margin={float(getattr(self.config, 'stage2_ap_margin', 0.1)):.3f})"
     )
-    title = "Dual-View Aligned Prototype Learning"
+    title = "Dual-View Independent Prototype Learning"
     print(f"========== Stage 2 {title} ==========")
     self._run_stage2_ab_refinement(
         num_stage2_rounds=num_stage2_rounds,
