@@ -41,7 +41,6 @@ def build_common_preset_overrides(
     for key in (
         "active_view",
         "dual_view_feature_mode",
-        "joint_core_mode",
         "scaler_fit_mode",
         "stage2_method",
         "tcn_activation",
@@ -98,56 +97,19 @@ TRAIN_OVERRIDE_KEYS = [
     "tcn_dropout",
     "tcn_activation",
     "use_attentive_pooling",
-    "topk_ratio",
-    "topk_k",
-    "dual_history_len",
-    "dual_current_out",
-    "dual_short_out",
-    "dual_long_out",
     "active_view",
     "dual_view_feature_mode",
-    "dual_score_weight_v1",
-    "dual_score_weight_v2",
-    "dual_score_weight_cv",
-    "dual_view_center_weight",
-    "dual_view_recon_weight",
     "stage2_method",
-    "prototype_mode",
     "state_dim",
     "num_prototypes",
     "proto_temperature",
-    "q_joint_sharpen_temperature",
-    "lambda_state_consistency",
-    "lambda_proto_pull",
-    "lambda_proto_repulsion",
-    "proto_repulsion_margin",
-    "lambda_proto_separation",
     "proto_separation_margin",
-    "proto_separation_force_weight",
-    "tau_conf",
-    "joint_core_mode",
-    "joint_core_dist_quantile",
-    "joint_core_recon_quantile",
-    "stage2_balanced_core",
-    "stage2_balanced_core_max_fraction",
-    "stage2_balanced_core_min_per_proto",
-    "lambda_proto_usage_balance",
-    "stage2_time_kmeans_max_tokens",
-    "stage2_time_kmeans_mode",
-    "stage2_time_core_dist_quantile",
-    "stage2_proto_ema_update",
-    "stage2_proto_ema_decay",
-    "stage2_proto_ema_min_tokens",
-    "lambda_injected_push",
     "stage2_injected_margin",
-    "lambda_js_score",
-    "prototype_recon_weight",
     "active_pool_trim_enabled",
     "active_pool_trim_stage0_ratio",
     "active_pool_trim_stage1_ratio",
     "epoch_stage0",
     "epoch_stage1",
-    "epoch_stage2",
     "batch_size",
     "lr",
     "weight_decay",
@@ -159,48 +121,28 @@ TRAIN_OVERRIDE_KEYS = [
     "pin_memory",
     "enable_tf32",
     "cudnn_benchmark",
-    "lambda_ctx_stage1",
     "stage1_positive_offset",
-    "stage1_positive_direction",
     "stage1_inject_context_len",
     "lambda_stage1_triplet",
-    "lambda_cv_stage1",
     "stage1_ap_margin",
     "stage1_triplet_margin",
     "num_stage2_rounds",
-    "epochs_per_stage2_round",
     "stage2_a_epochs",
     "stage2_b_epochs",
     "stage2_inject_context_len",
     "core_ratio_A",
-    "alpha_A",
-    "beta_A",
-    "gamma_A",
-    "proto_momentum",
-    "pair_align_strength",
     "min_core_per_proto",
     "lambda_pull_A",
     "lambda_sep_A",
-    "lambda_pair_A",
     "core_ratio_B",
-    "alpha_B",
-    "beta_B",
-    "gamma_B",
     "lambda_rec_B",
     "lambda_ap_B",
     "lambda_core_B",
     "lambda_neg_B",
-    "lambda_pull_B",
-    "lambda_align_B",
-    "lambda_cv_B",
-    "lambda_delta_B",
-    "lambda_anom_B",
     "stage2_ap_margin",
     "boundary_quantile",
     "negative_boundary_margin",
     "use_negative_boundary_radius",
-    "margin_anom",
-    "stage2_lambda_rec",
     "decision_quantile",
     "enable_stage_visualization",
     "enable_stage1_recon_scoring",
@@ -243,12 +185,6 @@ def build_parser(
     parser.add_argument("--tcn_dropout", type=float, default=None)
     parser.add_argument("--tcn_activation", type=str, default=None)
     parser.add_argument("--use_attentive_pooling", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--topk_ratio", type=float, default=None)
-    parser.add_argument("--topk_k", type=int, default=None)
-    parser.add_argument("--dual_history_len", type=int, default=None)
-    parser.add_argument("--dual_current_out", type=int, default=None)
-    parser.add_argument("--dual_short_out", type=int, default=None)
-    parser.add_argument("--dual_long_out", type=int, default=None)
     parser.add_argument(
         "--active_view",
         type=str,
@@ -256,11 +192,6 @@ def build_parser(
         choices=["v1", "v2_flatten", "dual"],
     )
     parser.add_argument("--dual_view_feature_mode", type=str, default=None, choices=["avg", "v1", "v2"])
-    parser.add_argument("--dual_score_weight_v1", type=float, default=None)
-    parser.add_argument("--dual_score_weight_v2", type=float, default=None)
-    parser.add_argument("--dual_score_weight_cv", type=float, default=None)
-    parser.add_argument("--dual_view_center_weight", type=float, default=None)
-    parser.add_argument("--dual_view_recon_weight", type=float, default=None)
     parser.add_argument(
         "--stage2_method",
         type=str,
@@ -270,39 +201,14 @@ def build_parser(
     parser.add_argument("--state_dim", type=int, default=None)
     parser.add_argument("--num_prototypes", type=int, default=None)
     parser.add_argument("--proto_temperature", type=float, default=None)
-    parser.add_argument("--q_joint_sharpen_temperature", type=float, default=None)
-    parser.add_argument("--lambda_state_consistency", type=float, default=None)
-    parser.add_argument("--lambda_proto_pull", type=float, default=None)
-    parser.add_argument("--lambda_proto_repulsion", type=float, default=None)
-    parser.add_argument("--proto_repulsion_margin", type=float, default=None)
-    parser.add_argument("--lambda_proto_separation", type=float, default=None)
     parser.add_argument("--proto_separation_margin", type=float, default=None)
-    parser.add_argument("--proto_separation_force_weight", type=float, default=None)
-    parser.add_argument("--tau_conf", type=float, default=None)
-    parser.add_argument("--joint_core_mode", type=str, default=None, choices=["minimal", "robust"])
-    parser.add_argument("--joint_core_dist_quantile", type=float, default=None)
-    parser.add_argument("--joint_core_recon_quantile", type=float, default=None)
-    parser.add_argument("--stage2_balanced_core", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--stage2_balanced_core_max_fraction", type=float, default=None)
-    parser.add_argument("--stage2_balanced_core_min_per_proto", type=int, default=None)
-    parser.add_argument("--lambda_proto_usage_balance", type=float, default=None)
-    parser.add_argument("--stage2_time_kmeans_max_tokens", type=int, default=None)
-    parser.add_argument("--stage2_time_kmeans_mode", type=str, default=None, choices=["last", "all"])
-    parser.add_argument("--stage2_time_core_dist_quantile", type=float, default=None)
-    parser.add_argument("--stage2_proto_ema_update", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--stage2_proto_ema_decay", type=float, default=None)
-    parser.add_argument("--stage2_proto_ema_min_tokens", type=int, default=None)
-    parser.add_argument("--lambda_injected_push", type=float, default=None)
     parser.add_argument("--stage2_injected_margin", type=float, default=None)
-    parser.add_argument("--lambda_js_score", type=float, default=None)
-    parser.add_argument("--prototype_recon_weight", type=float, default=None)
     parser.add_argument("--active_pool_trim_enabled", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--active_pool_trim_stage0_ratio", type=float, default=None)
     parser.add_argument("--active_pool_trim_stage1_ratio", type=float, default=None)
 
     parser.add_argument("--epoch_stage0", type=int, default=None)
     parser.add_argument("--epoch_stage1", type=int, default=None)
-    parser.add_argument("--epoch_stage2", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--weight_decay", type=float, default=None)
@@ -315,49 +221,29 @@ def build_parser(
     parser.add_argument("--enable_tf32", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--cudnn_benchmark", action=argparse.BooleanOptionalAction, default=None)
 
-    parser.add_argument("--lambda_ctx_stage1", type=float, default=None)
     parser.add_argument("--stage1_positive_offset", type=int, default=None)
-    parser.add_argument("--stage1_positive_direction", type=str, default=None)
     parser.add_argument("--stage1_inject_context_len", type=int, default=None)
     parser.add_argument("--lambda_stage1_triplet", type=float, default=None)
-    parser.add_argument("--lambda_cv_stage1", type=float, default=None)
     parser.add_argument("--stage1_ap_margin", type=float, default=None)
     parser.add_argument("--stage1_triplet_margin", type=float, default=None)
 
     parser.add_argument("--num_stage2_rounds", type=int, default=None)
-    parser.add_argument("--epochs_per_stage2_round", type=int, default=None)
     parser.add_argument("--stage2_a_epochs", type=int, default=None)
     parser.add_argument("--stage2_b_epochs", type=int, default=None)
     parser.add_argument("--stage2_inject_context_len", type=int, default=None)
     parser.add_argument("--core_ratio_A", type=float, default=None)
-    parser.add_argument("--alpha_A", type=float, default=None)
-    parser.add_argument("--beta_A", type=float, default=None)
-    parser.add_argument("--gamma_A", type=float, default=None)
-    parser.add_argument("--proto_momentum", type=float, default=None)
-    parser.add_argument("--pair_align_strength", type=float, default=None)
     parser.add_argument("--min_core_per_proto", type=int, default=None)
     parser.add_argument("--lambda_pull_A", type=float, default=None)
     parser.add_argument("--lambda_sep_A", type=float, default=None)
-    parser.add_argument("--lambda_pair_A", type=float, default=None)
     parser.add_argument("--core_ratio_B", type=float, default=None)
-    parser.add_argument("--alpha_B", type=float, default=None)
-    parser.add_argument("--beta_B", type=float, default=None)
-    parser.add_argument("--gamma_B", type=float, default=None)
     parser.add_argument("--lambda_rec_B", type=float, default=None)
     parser.add_argument("--lambda_ap_B", type=float, default=None)
     parser.add_argument("--lambda_core_B", type=float, default=None)
     parser.add_argument("--lambda_neg_B", type=float, default=None)
-    parser.add_argument("--lambda_pull_B", type=float, default=None)
-    parser.add_argument("--lambda_align_B", type=float, default=None)
-    parser.add_argument("--lambda_cv_B", type=float, default=None)
-    parser.add_argument("--lambda_delta_B", type=float, default=None)
-    parser.add_argument("--lambda_anom_B", type=float, default=None)
     parser.add_argument("--stage2_ap_margin", type=float, default=None)
     parser.add_argument("--boundary_quantile", type=float, default=None)
     parser.add_argument("--negative_boundary_margin", type=float, default=None)
     parser.add_argument("--use_negative_boundary_radius", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--margin_anom", type=float, default=None)
-    parser.add_argument("--stage2_lambda_rec", type=float, default=None)
     parser.add_argument("--decision_quantile", type=float, default=None)
 
     parser.add_argument("--enable_stage_visualization", action=argparse.BooleanOptionalAction, default=None)

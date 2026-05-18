@@ -40,12 +40,6 @@ class AnomalyDetector(nn.Module):
         num_prototypes: int = 1,
         proto_temperature: float = 0.2,
         stage2_method: str = "separate_proto",
-        topk_ratio: float = 0.1,
-        topk_k: int = 0,
-        dual_history_len: int = 20,
-        dual_current_out: int = 8,
-        dual_short_out: int = 16,
-        dual_long_out: int = 16,
     ):
         super().__init__()
         self.gravity_tau = gravity_tau
@@ -56,12 +50,6 @@ class AnomalyDetector(nn.Module):
         self.is_dual_view = self.active_view == "dual"
         self.tcn_kernel_size = int(tcn_kernel_size)
         self.v2_first_kernel_size = int(v2_first_kernel_size)
-        self.topk_ratio = float(topk_ratio)
-        self.topk_k = int(topk_k)
-        self.dual_history_len = max(1, int(dual_history_len))
-        self.dual_current_out = max(1, int(dual_current_out))
-        self.dual_short_out = max(1, int(dual_short_out))
-        self.dual_long_out = max(1, int(dual_long_out))
         self.state_dim = int(state_dim) if int(state_dim) > 0 else int(latent_dim)
         if self.state_dim != int(latent_dim):
             raise ValueError(
@@ -79,9 +67,6 @@ class AnomalyDetector(nn.Module):
                 in_channels=self.raw_in_channels,
                 d_model=latent_dim,
                 history_len=self.raw_seq_len,
-                current_out=self.dual_current_out,
-                short_out=self.dual_short_out,
-                long_out=self.dual_long_out,
                 dropout=dropout,
                 activation=tcn_activation,
             )

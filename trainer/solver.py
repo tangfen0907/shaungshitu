@@ -133,12 +133,6 @@ class Solver:
             ),
             proto_temperature=float(getattr(self.config, "proto_temperature", 0.2)),
             stage2_method=str(getattr(self.config, "stage2_method", "separate_proto")),
-            topk_ratio=float(getattr(self.config, "topk_ratio", 0.1)),
-            topk_k=int(getattr(self.config, "topk_k", 0)),
-            dual_history_len=int(getattr(self.config, "dual_history_len", 20)),
-            dual_current_out=int(getattr(self.config, "dual_current_out", 8)),
-            dual_short_out=int(getattr(self.config, "dual_short_out", 16)),
-            dual_long_out=int(getattr(self.config, "dual_long_out", 16)),
         ).to(self.device)
 
         self.optimizer = Adam(
@@ -346,11 +340,6 @@ class Solver:
         # the old shape[0] > shape[1] heuristic would flip the axes wrongly.
         self.config.seq_len = int(window.shape[0])
         self.config.in_channels = int(window.shape[1])
-        if str(getattr(self.config, "active_view", "")).strip().lower() == "dual":
-            # New dual-view route: the dataloader window length is L itself.
-            # Keep dual_history_len synchronized so logs/injection config do
-            # not accidentally refer to the old T=100 + inner-L design.
-            self.config.dual_history_len = int(self.config.seq_len)
         if int(getattr(self.config, "state_dim", 0)) <= 0:
             self.config.state_dim = int(getattr(self.config, "latent_dim", 0))
 

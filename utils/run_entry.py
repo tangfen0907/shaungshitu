@@ -201,7 +201,7 @@ def _encoder_config_summary(config: Config) -> str:
     active_view = str(getattr(config, "active_view", "v1")).strip().lower()
     if active_view == "dual":
         channels = int(getattr(config, "in_channels", 0))
-        history_len = int(getattr(config, "seq_len", getattr(config, "dual_history_len", 20)))
+        history_len = int(getattr(config, "seq_len", 20))
         short_len = max(1, history_len // 2)
         flat_len = channels * history_len
         flat_short_len = max(1, flat_len // 2)
@@ -254,14 +254,13 @@ def print_train_summary(config: Config, run_dir: str, run_name: str, experiment_
         f"in_channels={config.in_channels} | "
         f"active_view={getattr(config, 'active_view', 'v1')} | "
         f"dual_feature={getattr(config, 'dual_view_feature_mode', 'avg')} | "
-        f"dual_view_evidence=(center={getattr(config, 'dual_view_center_weight', 1.0)}, recon={getattr(config, 'dual_view_recon_weight', 0.5)}) | "
         f"left_pad_windows={getattr(config, 'left_pad_windows', True)} | "
         f"{_encoder_config_summary(config)} | "
         f"{_encoder_backbone_summary(config)}"
     )
     print(
         "Training: "
-        f"epochs=({config.epoch_stage0}, {config.epoch_stage1}, {config.epoch_stage2}) | "
+        f"epochs=({config.epoch_stage0}, {config.epoch_stage1}) | "
         f"batch_size={config.batch_size} | "
         f"lr={config.lr} | "
         f"seed={config.seed} | "
@@ -302,11 +301,9 @@ def print_train_summary(config: Config, run_dir: str, run_name: str, experiment_
         f"sep={getattr(config, 'lambda_sep_A', 0.1)}) | "
         f"B=(rec={getattr(config, 'lambda_rec_B', 1.0)}, "
         f"ap={getattr(config, 'lambda_ap_B', 0.2)}, "
-        f"core={getattr(config, 'lambda_core_B', getattr(config, 'lambda_pull_B', 0.5))}, "
-        f"neg={getattr(config, 'lambda_neg_B', getattr(config, 'lambda_anom_B', 0.05))}, "
+        f"core={getattr(config, 'lambda_core_B', 0.5)}, "
+        f"neg={getattr(config, 'lambda_neg_B', 0.05)}, "
         f"boundary_q={getattr(config, 'boundary_quantile', 0.95)}) | "
-        f"js={getattr(config, 'lambda_js_score', 1.0)} | "
-        f"proto_recon={getattr(config, 'prototype_recon_weight', 0.5)} | "
         f"threshold_q={config.decision_quantile}"
     )
     print(
@@ -341,7 +338,6 @@ def print_eval_summary(
         f"in_channels={config.in_channels} | "
         f"active_view={getattr(config, 'active_view', 'v1')} | "
         f"dual_feature={getattr(config, 'dual_view_feature_mode', 'avg')} | "
-        f"dual_view_evidence=(center={getattr(config, 'dual_view_center_weight', 1.0)}, recon={getattr(config, 'dual_view_recon_weight', 0.5)}) | "
         f"{_encoder_config_summary(config)} | "
         f"{_encoder_backbone_summary(config)}"
     )
@@ -349,9 +345,7 @@ def print_eval_summary(
         "Evaluation: "
         f"method={getattr(config, 'stage2_method', 'separate_proto')} | "
         f"num_prototypes={getattr(config, 'num_prototypes', 0)} | "
-        f"threshold_q={config.decision_quantile} | "
-        f"js={getattr(config, 'lambda_js_score', 1.0)} | "
-        f"proto_recon={getattr(config, 'prototype_recon_weight', 0.5)}"
+        f"threshold_q={config.decision_quantile}"
     )
 
 

@@ -45,7 +45,7 @@ def run_train_loop(solver):
     )
     if self._is_dual_view_model():
         channels = int(getattr(self.config, "in_channels", 0))
-        history_len = int(getattr(self.config, "seq_len", getattr(self.config, "dual_history_len", 20)))
+        history_len = int(getattr(self.config, "seq_len", 20))
         short_len = max(1, history_len // 2)
         flat_len = channels * history_len
         flat_short_len = max(1, flat_len // 2)
@@ -97,8 +97,8 @@ def run_train_loop(solver):
         f"B=(core={float(getattr(self.config, 'core_ratio_B', 0.5)):.3f}, "
         f"rec={float(getattr(self.config, 'lambda_rec_B', 1.0)):.3f}, "
         f"ap={float(getattr(self.config, 'lambda_ap_B', 0.2)):.3f}, "
-        f"core_pull={float(getattr(self.config, 'lambda_core_B', getattr(self.config, 'lambda_pull_B', 0.5))):.3f}, "
-        f"neg={float(getattr(self.config, 'lambda_neg_B', getattr(self.config, 'lambda_anom_B', 0.05))):.3f}, "
+        f"core_pull={float(getattr(self.config, 'lambda_core_B', 0.5)):.3f}, "
+        f"neg={float(getattr(self.config, 'lambda_neg_B', 0.05)):.3f}, "
         f"ap_margin={float(getattr(self.config, 'stage2_ap_margin', 0.1)):.3f})"
     )
     title = "Dual-View Independent Prototype Learning"

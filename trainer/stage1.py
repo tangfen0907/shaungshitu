@@ -12,10 +12,6 @@ from data_factory.triplet_dataset import Stage1AdjacentPairDataset
 __all__ = [
     "_inject_context_len",
     "_inject_last_context",
-    "_stage1_negative_block_chunk_size",
-    "_stage1_pointwise_context_blocks",
-    "_stage1_negative_point_embeddings",
-    "_stage1_pointwise_apn_loss",
     "_prepare_stage1_apn_batch",
     "_normal_only_warmup_epoch",
     "_build_stage1_loader",
@@ -30,7 +26,7 @@ def _inject_context_len(self, stage: str = "stage1") -> int:
     # default anomaly injection acts on the whole current L-window, not on the
     # tail of a larger T=100 window.
     if configured <= 0:
-        configured = int(getattr(self.config, "seq_len", getattr(self.config, "dual_history_len", 20)))
+        configured = int(getattr(self.config, "seq_len", 20))
     return max(1, configured)
 
 
@@ -59,46 +55,6 @@ def _inject_last_context(
     context = x_negative[:, :, -inject_len:]
     x_negative[:, :, -inject_len:] = self.injector(context)
     return x_negative
-
-
-# The following three helpers are retained as compatibility stubs for older
-# imports/tests. They must not be used by the new local-window Stage1 route,
-# because H is [B, d], not [B, L, d].
-def _stage1_negative_block_chunk_size(self, total_blocks: int) -> int:
-    configured = int(getattr(self.config, "stage1_negative_chunk_size", 1024))
-    if configured <= 0:
-        return max(1, int(total_blocks))
-    return max(1, min(int(configured), int(total_blocks)))
-
-
-def _stage1_pointwise_context_blocks(self, x: torch.Tensor, *, context_len: int = None):
-    raise RuntimeError(
-        "Stage1 pointwise in-window token blocks belong to the old [B,T,d] route. "
-        "In the new route each dataset sample is already X_t: [B,M,L] and only "
-        "outputs H_t: [B,d]."
-    )
-
-
-def _stage1_negative_point_embeddings(self, negative_blocks: torch.Tensor, *, batch_size: int, num_points: int):
-    raise RuntimeError(
-        "Stage1 negative point embeddings belong to the old [B,T,d] route. "
-        "Use the injected local window X_t_neg and encode it directly."
-    )
-
-
-def _stage1_pointwise_apn_loss(
-    self,
-    outputs,
-    n1: torch.Tensor,
-    n2: torch.Tensor,
-    *,
-    anchor_start: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    raise RuntimeError(
-        "Stage1 A/P/N cannot use H[:, -2, :] in the new local-window encoder. "
-        "If the P branch is enabled later, P must come from a separate X_{t-1} "
-        "window, not from the current sample's hidden tensor."
-    )
 
 
 def _prepare_stage1_apn_batch(self, batch) -> Tuple[torch.Tensor, torch.Tensor]:

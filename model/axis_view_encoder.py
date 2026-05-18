@@ -39,18 +39,10 @@ class PointwiseDualEncoder(nn.Module):
         in_channels: int,
         d_model: int,
         history_len: int = 20,
-        current_out: int = 8,
-        short_out: int = 16,
-        long_out: int = 16,
         dropout: float = 0.0,
         activation: str = "relu",
     ):
         super().__init__()
-        # current_out/short_out/long_out are kept only for backward-compatible
-        # config construction. The new encoder's dimensions are determined by
-        # M and L exactly as specified by the local-window design.
-        del current_out, short_out, long_out
-
         self.in_channels = max(1, int(in_channels))  # M
         self.d_model = int(d_model)
         self.history_len = max(1, int(history_len))  # L, now the full input window length.
@@ -124,7 +116,7 @@ class PointwiseDualEncoder(nn.Module):
             raise ValueError(
                 "The new local-window encoder requires the dataloader window length to equal L. "
                 f"Expected L={self.history_len}, got L={int(x.size(2))}. "
-                "Set seq_len/dual_history_len to the same local history length."
+                "Set seq_len to the intended local history length."
             )
 
     def _view1_features(self, x: torch.Tensor) -> torch.Tensor:
