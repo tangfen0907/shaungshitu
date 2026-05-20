@@ -35,13 +35,15 @@ def run_train_loop(solver):
         "reconstruction=current_point | "
         "negative=inject_local_L_window | "
         "positive=X_t_minus_1 | "
-        "geometry=small_margin_AP_hinge+negative_boundary_hinge | "
-        "away=absolute_margin | "
+        "geometry=raw_latent_local_pos+local_neg | "
+        "detach=off | "
+        "normalize=off | "
+        "prototype=off | "
         f"context_len={self._inject_context_len('stage1')} | "
-        f"lambda_triplet={float(getattr(self.config, 'lambda_stage1_triplet', 1.0)):.3f} | "
-        f"ap_margin={float(getattr(self.config, 'stage1_ap_margin', 0.1)):.3f} | "
+        f"lambda_local={float(getattr(self.config, 'lambda_stage1_local', 1.0)):.3f} | "
+        f"pos_margin={float(getattr(self.config, 'stage1_pos_margin', 0.1)):.3f} | "
         "lambda_cv=off | "
-        f"triplet_margin={float(getattr(self.config, 'stage1_triplet_margin', 0.3)):.3f}"
+        f"neg_margin={float(getattr(self.config, 'stage1_neg_margin', 0.3)):.3f}"
     )
     if self._is_dual_view_model():
         channels = int(getattr(self.config, "in_channels", 0))

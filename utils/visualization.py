@@ -1337,12 +1337,15 @@ def _save_stage2_component_score_visualizations(self, stage_key: str = "stage2")
         h2_prev=test_outputs["u2"][test_prev],
         eps=eps,
     )
-
     specs = [
         ("score_recon_v1", "v1", "stage2_score_recon_v1"),
         ("score_recon_v2", "v2", "stage2_score_recon_v2"),
         ("score_proto_v1", "v1", "stage2_score_proto_v1"),
         ("score_proto_v2", "v2", "stage2_score_proto_v2"),
+        ("score_local_v1", "v1", "stage2_score_local_v1"),
+        ("score_local_v2", "v2", "stage2_score_local_v2"),
+        ("score_local_sum", "v1", "stage2_score_local_sum_view1"),
+        ("score_local_sum", "v2", "stage2_score_local_sum_view2"),
         ("score_proto_ap_gap_v1", "v1", "stage2_score_proto_ap_gap_v1"),
         ("score_proto_ap_gap_v2", "v2", "stage2_score_proto_ap_gap_v2"),
         ("score_proto_ap_gap_sum", "v1", "stage2_score_proto_ap_gap_sum_view1"),

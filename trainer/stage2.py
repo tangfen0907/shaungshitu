@@ -8,7 +8,7 @@ from torch.optim import Adam
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from data_factory.triplet_dataset import Stage1AdjacentPairDataset
+from data_factory.local_window_dataset import Stage1AdjacentPairDataset
 from utils.clustering import _cluster_features, _nearest_other_clusters
 
 # This route removes strong cross-view alignment from the dual-view prototype
@@ -217,7 +217,7 @@ def _build_stage2_b_loader(self) -> DataLoader:
     try:
         pair_dataset = Stage1AdjacentPairDataset(
             base_dataset=base_dataset,
-            positive_offset=1,
+            positive_offset=int(getattr(self.config, "stage2_positive_offset", 1)),
             positive_direction="past",
             active_mask=active_mask,
             in_channels=int(getattr(self.config, "in_channels", 0)),
@@ -801,9 +801,11 @@ def _run_stage2_b_epoch(
     epoch_in_phase: int,
     global_epoch: int,
     total_epochs: int,
+    refresh_radius: bool = True,
 ):
     self._set_stage2_train_phase("B")
-    self._refresh_stage2_boundary_radii()
+    if bool(refresh_radius):
+        self._refresh_stage2_boundary_radii()
     self.model.train()
     totals = {
         "loss": 0.0,
@@ -1076,6 +1078,24 @@ def _run_stage2_ab_refinement(
     loader = self._build_stage2_loader()
     loader_b = self._build_stage2_b_loader()
     global_epoch = 1
+    radius_refresh_mode = str(
+        getattr(self.config, "stage2_radius_refresh_mode", "b_epoch") or "b_epoch"
+    ).strip().lower()
+    aliases = {
+        "b": "b_epoch",
+        "each_b": "b_epoch",
+        "each_b_epoch": "b_epoch",
+        "epoch": "b_epoch",
+        "per_b_epoch": "b_epoch",
+        "per_epoch": "b_epoch",
+        "per_round": "round",
+        "round_start": "round",
+        "after_a": "round",
+    }
+    radius_refresh_mode = aliases.get(radius_refresh_mode, radius_refresh_mode)
+    if radius_refresh_mode not in {"b_epoch", "round"}:
+        raise ValueError("stage2_radius_refresh_mode should be 'b_epoch' or 'round'.")
+    print(f"[Stage2] boundary radius refresh mode: {radius_refresh_mode}")
     for round_idx in range(1, int(num_stage2_rounds) + 1):
         print(f"[Stage2] Starting round {round_idx}/{int(num_stage2_rounds)}")
         for epoch_in_phase in range(1, int(stage2_a_epochs) + 1):
@@ -1087,6 +1107,9 @@ def _run_stage2_ab_refinement(
                 total_epochs=total_stage2_epochs,
             )
             global_epoch += 1
+        if radius_refresh_mode == "round":
+            self._set_stage2_train_phase("B")
+            self._refresh_stage2_boundary_radii()
         for epoch_in_phase in range(1, int(stage2_b_epochs) + 1):
             self._run_stage2_b_epoch(
                 loader=loader_b,
@@ -1094,6 +1117,7 @@ def _run_stage2_ab_refinement(
                 epoch_in_phase=epoch_in_phase,
                 global_epoch=global_epoch,
                 total_epochs=total_stage2_epochs,
+                refresh_radius=(radius_refresh_mode == "b_epoch"),
             )
             global_epoch += 1
     self._refresh_aligned_stage2_state(round_idx=int(num_stage2_rounds))

@@ -13,6 +13,7 @@ from metrics.affiliation.metrics import pr_from_events
 from metrics.f1_score_f1_pa import get_adjust_F1PA
 from trainer.stage2 import _prototype_min_pairwise_distance
 from utils.scoring import (
+    compute_multilag_local_component_scores,
     compute_separate_proto_component_scores,
     previous_indices_from_point_indices,
 )
@@ -622,7 +623,8 @@ def _evaluate_score_family(
     y_count: np.ndarray,
     item_indices: np.ndarray = None,
     item_name: str = "window",
-) -> Tuple[Dict[str, float], np.ndarray, float]:
+    alternate_targets: Dict[str, Tuple[np.ndarray, np.ndarray]] = None,
+) -> Tuple[Dict[str, float], np.ndarray, float, Dict[str, Dict[str, float]]]:
     train_scores = np.asarray(train_scores, dtype=np.float32).reshape(-1)
     test_scores = np.asarray(test_scores, dtype=np.float32).reshape(-1)
     pred_labels, threshold = self._threshold_scores(train_scores, test_scores)
@@ -650,7 +652,40 @@ def _evaluate_score_family(
     )
     for key, value in metrics.items():
         print(f"[Test][{label}] {key}: {value:.6f}")
-    return metrics, pred_labels, threshold
+
+    alternate_metrics = {}
+    for target_name, (target_y_true, target_y_count) in (alternate_targets or {}).items():
+        target_y_true = np.asarray(target_y_true, dtype=np.int64).reshape(-1)
+        target_y_count = np.asarray(target_y_count, dtype=np.int64).reshape(-1)
+        if target_y_true.shape[0] != pred_labels.shape[0]:
+            raise ValueError(
+                f"Alternate target '{target_name}' length mismatch: "
+                f"labels={target_y_true.shape[0]} vs predictions={pred_labels.shape[0]}."
+            )
+        target_metrics = combine_all_evaluation_scores(
+            target_y_true.copy(),
+            pred_labels.copy(),
+            test_scores.copy(),
+        )
+        target_metrics = {str(key): float(value) for key, value in target_metrics.items()}
+        target_pred_counts = (
+            target_y_count[pred_anomaly_idx]
+            if pred_anomaly_idx.size > 0
+            else np.empty(0, dtype=np.int64)
+        )
+        print(
+            f"[Test][{label}][{target_name}] "
+            f"same predictions/threshold | pred_anomaly={int(pred_anomaly_idx.size)}"
+        )
+        print(
+            f"[Test][{label}][{target_name}] Pred anomaly {item_name} indices with label/count: "
+            f"{self._format_index_count_preview(display_indices, target_pred_counts)}"
+        )
+        for key, value in target_metrics.items():
+            print(f"[Test][{label}][{target_name}] {key}: {value:.6f}")
+        alternate_metrics[str(target_name)] = target_metrics
+
+    return metrics, pred_labels, threshold, alternate_metrics
 
 
 @staticmethod
@@ -922,11 +957,38 @@ def _test_dual_separate_proto(self):
         eps=eps,
     )
 
+    local_score_lags = tuple(int(lag) for lag in getattr(self.config, "local_score_lags", (1, 3, 5, 10)))
+    local_score_topk = int(getattr(self.config, "local_score_topk", 2))
+    train_components.update(
+        compute_multilag_local_component_scores(
+            train_outputs["u1"],
+            train_outputs["u2"],
+            train_outputs["point_indices"],
+            lags=local_score_lags,
+            topk=local_score_topk,
+        )
+    )
+    components.update(
+        compute_multilag_local_component_scores(
+            test_outputs["u1"],
+            test_outputs["u2"],
+            test_outputs["point_indices"],
+            lags=local_score_lags,
+            topk=local_score_topk,
+        )
+    )
+
     y_true = test_outputs["point_labels"]
     y_count = y_true.astype(np.int64)
+    y_true_window_any = self._build_window_anomaly_flags(self.test_loader.dataset)
+    y_count_window_any = self._build_window_anomaly_counts(self.test_loader.dataset)
     print(
-        f"[Test][Labels] point labels: normal={int(np.sum(y_true == 0))} | "
+        f"[Test][Labels] current-point labels: normal={int(np.sum(y_true == 0))} | "
         f"anomaly={int(np.sum(y_true == 1))} | total={int(y_true.shape[0])}"
+    )
+    print(
+        f"[Test][Labels] window-any labels: normal={int(np.sum(y_true_window_any == 0))} | "
+        f"anomaly={int(np.sum(y_true_window_any == 1))} | total={int(y_true_window_any.shape[0])}"
     )
     distance_analysis = self._analyze_test_latent_distances(test_outputs["u_joint"], y_true)
     proto_head = self.model.prototype_head_v1
@@ -994,7 +1056,10 @@ def _test_dual_separate_proto(self):
         f"{family_label} component scoring: "
         "no fused score emitted | "
         "scores=score_recon_v1,score_recon_v2,score_proto_v1,score_proto_v2,"
+        "score_local_v1,score_local_v2,score_local_sum,"
+        "score_local_multilag_{mean,max,top2}_{v1,v2,sum},"
         "score_proto_ap_gap_v1,score_proto_ap_gap_v2,score_proto_ap_gap_sum | "
+        f"local_lags={list(local_score_lags)} | local_topk={local_score_topk} | "
         f"K={num_prototypes} | "
         f"state_dim={int(getattr(self.model, 'state_dim', 0))}"
     )
@@ -1023,13 +1088,25 @@ def _test_dual_separate_proto(self):
         ("score_recon_v2", f"{family_label}ScoreReconV2"),
         ("score_proto_v1", f"{family_label}ScoreProtoV1"),
         ("score_proto_v2", f"{family_label}ScoreProtoV2"),
+        ("score_local_v1", f"{family_label}ScoreLocalV1"),
+        ("score_local_v2", f"{family_label}ScoreLocalV2"),
+        ("score_local_sum", f"{family_label}ScoreLocalSum"),
+        ("score_local_multilag_mean_v1", f"{family_label}ScoreLocalMultiLagMeanV1"),
+        ("score_local_multilag_mean_v2", f"{family_label}ScoreLocalMultiLagMeanV2"),
+        ("score_local_multilag_mean_sum", f"{family_label}ScoreLocalMultiLagMeanSum"),
+        ("score_local_multilag_max_v1", f"{family_label}ScoreLocalMultiLagMaxV1"),
+        ("score_local_multilag_max_v2", f"{family_label}ScoreLocalMultiLagMaxV2"),
+        ("score_local_multilag_max_sum", f"{family_label}ScoreLocalMultiLagMaxSum"),
+        ("score_local_multilag_top2_v1", f"{family_label}ScoreLocalMultiLagTop2V1"),
+        ("score_local_multilag_top2_v2", f"{family_label}ScoreLocalMultiLagTop2V2"),
+        ("score_local_multilag_top2_sum", f"{family_label}ScoreLocalMultiLagTop2Sum"),
         ("score_proto_ap_gap_v1", f"{family_label}ScoreProtoAPGapV1"),
         ("score_proto_ap_gap_v2", f"{family_label}ScoreProtoAPGapV2"),
         ("score_proto_ap_gap_sum", f"{family_label}ScoreProtoAPGapSum"),
     ]
     component_families = {}
     for score_key, score_label in score_specs:
-        family_metrics, family_pred, family_threshold = self._evaluate_score_family(
+        family_metrics, family_pred, family_threshold, family_alternate_metrics = self._evaluate_score_family(
             label=score_label,
             train_scores=train_components[score_key],
             test_scores=components[score_key],
@@ -1037,9 +1114,14 @@ def _test_dual_separate_proto(self):
             y_count=y_count,
             item_indices=test_outputs["point_indices"],
             item_name="point",
+            alternate_targets={
+                "window-any": (y_true_window_any, y_count_window_any),
+            },
         )
         component_families[score_key] = {
             "metrics": family_metrics,
+            "metrics_current_point": family_metrics,
+            "metrics_window_any": family_alternate_metrics.get("window-any", {}),
             "threshold": family_threshold,
             "train_scores": train_components[score_key],
             "test_scores": components[score_key],
@@ -1050,6 +1132,8 @@ def _test_dual_separate_proto(self):
         "metrics": {},
         "threshold": None,
         "y_true": y_true,
+        "y_true_current_point": y_true,
+        "y_true_window_any": y_true_window_any,
         "pred_labels": None,
         "scores": None,
         "components": components,
@@ -1063,5 +1147,4 @@ def _test_dual_separate_proto(self):
 
 
 def run_evaluation(solver):
-    self = solver
-    return self._test_dual_separate_proto()
+    return solver._test_dual_separate_proto()

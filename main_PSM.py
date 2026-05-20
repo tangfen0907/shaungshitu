@@ -1,4 +1,4 @@
-RUN_NAME = 'psm_experiment'
+﻿RUN_NAME = 'psm_experiment'
 
 # PSM preset for the new local-window dual-view route:
 #   X_t: [B, M, L] -> H1_t/H2_t: [B, d_model]
@@ -30,14 +30,14 @@ LOCAL_CONFIG_OVERRIDES = {
     'lr': 1e-3,
     'weight_decay': 1e-5,
 
-    # Stage1 local-window A/P/N.
-    # P comes from X_{t-1}; geometry follows the teacher-version raw latent
-    # objective with an absolute injected margin.
+    # Stage1 local-window raw-latent objective.
+    # A reconstructs the current point; A/P are kept close and injected N is
+    # pushed away. No detach, no normalization, and prototypes stay off.
     'stage1_inject_context_len': 20,
-    'lambda_rec': 1.0,
-    'lambda_stage1_triplet': 1.0,
-    'stage1_ap_margin': 0.1,
-    'stage1_triplet_margin': 0.3,
+    'lambda_rec': 0.1,
+    'lambda_stage1_local': 1.0,
+    'stage1_pos_margin': 0.1,
+    'stage1_neg_margin': 0.3,
     'active_pool_trim_enabled': False,
     'active_pool_trim_stage0_ratio': 0.0,
     'active_pool_trim_stage1_ratio': 0.0,
@@ -52,14 +52,13 @@ LOCAL_CONFIG_OVERRIDES = {
     'lambda_pull_A': 1.0,
     'lambda_sep_A': 0.1,
     'core_ratio_B': 0.5,
-    'lambda_rec_B': 1.0,
+    'lambda_rec_B': 0.1,
     'lambda_ap_B': 0.2,
     'lambda_core_B': 0.5,
     'lambda_neg_B': 0.05,
     'stage2_ap_margin': 0.1,
     'boundary_quantile': 0.95,
-    'negative_boundary_margin': 0.1,
-    'use_negative_boundary_radius': True,
+    'stage2_relative_neg_margin': 0.1,
 
     # Scoring and visualization
     'decision_quantile': 0.995,

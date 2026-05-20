@@ -32,6 +32,8 @@ class Config:
     use_attentive_pooling: bool = False
     active_view: str = "v1"
     dual_view_feature_mode: str = "avg"
+    dual_encoder_type: str = "axis"
+    training_route: str = "proto_no_view_align"
     stage2_method: str = "separate_proto"
     state_dim: int = 0
     num_prototypes: int = 0
@@ -58,6 +60,8 @@ class Config:
     lambda_rec: float = 1.0
     decision_quantile: float = 0.995
     robust_eps: float = 1e-6
+    local_score_lags: Tuple[int, ...] = (1, 3, 5, 10)
+    local_score_topk: int = 2
 
     # Runtime and artifacts
     seed: int = 42
@@ -71,10 +75,11 @@ class Config:
     enable_tf32: bool = True
     cudnn_benchmark: bool = True
     stage1_positive_offset: int = 1
+    stage2_positive_offset: int = 1
     stage1_inject_context_len: int = 0
-    lambda_stage1_triplet: float = 1.0
-    stage1_ap_margin: float = 0.1
-    stage1_triplet_margin: float = 0.3
+    lambda_stage1_local: float = 1.0
+    stage1_pos_margin: float = 0.1
+    stage1_neg_margin: float = 0.3
     stage2_inject_context_len: int = 0
     core_ratio_A: float = 0.3
     min_core_per_proto: int = 1
@@ -89,6 +94,7 @@ class Config:
     boundary_quantile: float = 0.95
     negative_boundary_margin: float = 0.1
     use_negative_boundary_radius: bool = True
+    stage2_radius_refresh_mode: str = "b_epoch"
     enable_stage1_recon_scoring: bool = False
     enable_stage_visualization: bool = False
     visualization_max_points: int = 3000
@@ -132,6 +138,7 @@ _COMMON_EXPLICIT: Dict[str, object] = {
     "v2_first_kernel_size": 0,
     "tcn_dropout": 0.1,
     "tcn_activation": "relu",
+    "dual_encoder_type": "axis",
     "epoch_stage0": 10,
     "epoch_stage1": 10,
     "lr": 1e-3,
@@ -140,6 +147,7 @@ _COMMON_EXPLICIT: Dict[str, object] = {
     "stage2_a_epochs": 1,
     "stage2_b_epochs": 1,
     "stage2_method": "separate_proto",
+    "training_route": "proto_no_view_align",
     "state_dim": 0,
     "num_prototypes": 0,
     "proto_temperature": 0.2,
@@ -160,10 +168,11 @@ _COMMON_EXPLICIT: Dict[str, object] = {
     "enable_tf32": True,
     "cudnn_benchmark": True,
     "stage1_positive_offset": 1,
+    "stage2_positive_offset": 1,
     "stage1_inject_context_len": 0,
-    "lambda_stage1_triplet": 1.0,
-    "stage1_ap_margin": 0.1,
-    "stage1_triplet_margin": 0.3,
+    "lambda_stage1_local": 1.0,
+    "stage1_pos_margin": 0.1,
+    "stage1_neg_margin": 0.3,
     "stage2_inject_context_len": 0,
     "core_ratio_A": 0.3,
     "min_core_per_proto": 1,
@@ -178,6 +187,7 @@ _COMMON_EXPLICIT: Dict[str, object] = {
     "boundary_quantile": 0.95,
     "negative_boundary_margin": 0.1,
     "use_negative_boundary_radius": True,
+    "stage2_radius_refresh_mode": "b_epoch",
     "enable_stage_visualization": True,
     "visualization_max_points": 3000,
     "visualization_method": "tsne",
@@ -358,6 +368,7 @@ _STAGE2_METHOD_DEFAULTS: Dict[str, Dict[str, object]] = {
         "boundary_quantile": 0.95,
         "negative_boundary_margin": 0.1,
         "use_negative_boundary_radius": True,
+        "stage2_radius_refresh_mode": "b_epoch",
     },
 }
 
@@ -393,6 +404,19 @@ def apply_model_defaults(values: Dict[str, object]) -> Dict[str, object]:
     return merged
 
 
+def normalize_training_route(route: object) -> str:
+    normalized = str(route or "proto_no_view_align").strip().lower()
+    aliases = {
+        "proto-no-view-align": "proto_no_view_align",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized != "proto_no_view_align":
+        raise ValueError(
+            "training_route should be 'proto_no_view_align'."
+        )
+    return normalized
+
+
 def available_datasets() -> Tuple[str, ...]:
     return tuple(_DATASET_PRESETS.keys())
 
@@ -411,6 +435,9 @@ def build_dataset_config(dataset: str, overrides: Optional[Dict[str, object]] = 
     merged.update(_DATASET_PRESETS[key])
     if overrides:
         merged.update(dict(overrides))
+    merged["training_route"] = normalize_training_route(
+        merged.get("training_route", "proto_no_view_align")
+    )
     merged = apply_stage2_method_defaults(merged, explicit_overrides=overrides)
     merged = apply_model_defaults(merged)
     return Config.from_dict(merged)

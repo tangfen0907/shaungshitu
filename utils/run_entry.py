@@ -8,7 +8,7 @@ from typing import Dict, Optional
 import torch
 
 from trainer.solver import Solver
-from utils.config import Config, apply_model_defaults, apply_stage2_method_defaults
+from utils.config import Config, apply_model_defaults, apply_stage2_method_defaults, normalize_training_route
 from utils.io_utils import save_config_artifact, save_result_artifacts
 
 
@@ -109,6 +109,9 @@ def merge_configs(base_config: Config, overrides: Optional[Dict[str, object]] = 
     merged = base_config.to_dict()
     if overrides:
         merged.update(dict(overrides))
+    merged["training_route"] = normalize_training_route(
+        merged.get("training_route", "proto_no_view_align")
+    )
     merged = apply_stage2_method_defaults(merged, explicit_overrides=overrides)
     merged = apply_model_defaults(merged)
     return Config.from_dict(merged)
@@ -125,20 +128,32 @@ def load_json_overrides(path: Optional[str]) -> Dict[str, object]:
 
 
 def print_score_family_results(results: dict):
-    separated_labels = [
-        ("score_recon_v1", "score_recon_v1: View1 reconstruction score"),
-        ("score_recon_v2", "score_recon_v2: View2 reconstruction score"),
-        ("score_proto_v1", "score_proto_v1: View1 nearest-prototype squared distance"),
-        ("score_proto_v2", "score_proto_v2: View2 nearest-prototype squared distance"),
-        ("score_proto_ap_gap_v1", "score_proto_ap_gap_v1: max(0, d_proto_v1 - d_ap_v1)"),
-        ("score_proto_ap_gap_v2", "score_proto_ap_gap_v2: max(0, d_proto_v2 - d_ap_v2)"),
-        ("score_proto_ap_gap_sum", "score_proto_ap_gap_sum: view1 + view2 proto/AP gaps"),
-    ]
+    label_map = {
+        "score_recon_v1": "score_recon_v1: View1 reconstruction score",
+        "score_recon_v2": "score_recon_v2: View2 reconstruction score",
+        "score_proto_v1": "score_proto_v1: View1 nearest-prototype squared distance",
+        "score_proto_v2": "score_proto_v2: View2 nearest-prototype squared distance",
+        "score_local_v1": "score_local_v1: View1 distance to previous point embedding",
+        "score_local_v2": "score_local_v2: View2 distance to previous point embedding",
+        "score_local_sum": "score_local_sum: view1 + view2 previous-point distances",
+        "score_local_multilag_mean_v1": "score_local_multilag_mean_v1: View1 mean distance over multiple previous lags",
+        "score_local_multilag_mean_v2": "score_local_multilag_mean_v2: View2 mean distance over multiple previous lags",
+        "score_local_multilag_mean_sum": "score_local_multilag_mean_sum: view1 + view2 mean multi-lag distances",
+        "score_local_multilag_max_v1": "score_local_multilag_max_v1: View1 max distance over multiple previous lags",
+        "score_local_multilag_max_v2": "score_local_multilag_max_v2: View2 max distance over multiple previous lags",
+        "score_local_multilag_max_sum": "score_local_multilag_max_sum: view1 + view2 max multi-lag distances",
+        "score_local_multilag_top2_v1": "score_local_multilag_top2_v1: View1 top-2 mean distance over multiple previous lags",
+        "score_local_multilag_top2_v2": "score_local_multilag_top2_v2: View2 top-2 mean distance over multiple previous lags",
+        "score_local_multilag_top2_sum": "score_local_multilag_top2_sum: view1 + view2 top-2 mean multi-lag distances",
+        "score_proto_ap_gap_v1": "score_proto_ap_gap_v1: max(0, d_proto_v1 - d_ap_v1)",
+        "score_proto_ap_gap_v2": "score_proto_ap_gap_v2: max(0, d_proto_v2 - d_ap_v2)",
+        "score_proto_ap_gap_sum": "score_proto_ap_gap_sum: view1 + view2 proto/AP gaps",
+    }
     component_families = results.get("component_families", {})
-    for key, label in separated_labels:
-        family = component_families.get(key, {})
+    for key, family in component_families.items():
         if not family:
             continue
+        label = label_map.get(key, key)
         threshold = family.get("threshold")
         if threshold is None:
             print(f"\n{label}:")
@@ -200,8 +215,18 @@ def _resolved_window_steps(config: Config):
 def _encoder_config_summary(config: Config) -> str:
     active_view = str(getattr(config, "active_view", "v1")).strip().lower()
     if active_view == "dual":
+        dual_encoder_type = str(getattr(config, "dual_encoder_type", "axis")).strip().lower()
         channels = int(getattr(config, "in_channels", 0))
         history_len = int(getattr(config, "seq_len", 20))
+        if dual_encoder_type == "tcn":
+            return (
+                "dual_tcn | input=[B,M,L] -> H1/H2=[B,d] | "
+                f"L={history_len} | "
+                f"M={channels} | "
+                "view1=TCN([B,M,L]) | "
+                "view2=TCN([B,1,L*M]) | "
+                "reconstruction=current_point"
+            )
         short_len = max(1, history_len // 2)
         flat_len = channels * history_len
         flat_short_len = max(1, flat_len // 2)
@@ -224,6 +249,13 @@ def _encoder_config_summary(config: Config) -> str:
 def _encoder_backbone_summary(config: Config) -> str:
     active_view = str(getattr(config, "active_view", "v1")).strip().lower()
     if active_view == "dual":
+        dual_encoder_type = str(getattr(config, "dual_encoder_type", "axis")).strip().lower()
+        if dual_encoder_type == "tcn":
+            return (
+                f"tcn_layers={config.tcn_layers} | "
+                f"tcn_kernel={getattr(config, 'tcn_kernel_size', 3)} | "
+                f"d_model={getattr(config, 'latent_dim', 0)}"
+            )
         return f"d_model={getattr(config, 'latent_dim', 0)}"
     return (
         f"tcn_layers={config.tcn_layers} | "
@@ -254,6 +286,7 @@ def print_train_summary(config: Config, run_dir: str, run_name: str, experiment_
         f"in_channels={config.in_channels} | "
         f"active_view={getattr(config, 'active_view', 'v1')} | "
         f"dual_feature={getattr(config, 'dual_view_feature_mode', 'avg')} | "
+        f"dual_encoder={getattr(config, 'dual_encoder_type', 'axis')} | "
         f"left_pad_windows={getattr(config, 'left_pad_windows', True)} | "
         f"{_encoder_config_summary(config)} | "
         f"{_encoder_backbone_summary(config)}"
@@ -270,16 +303,20 @@ def print_train_summary(config: Config, run_dir: str, run_name: str, experiment_
         f"pin_memory={getattr(config, 'pin_memory', True)} | "
         f"tf32={getattr(config, 'enable_tf32', True)}"
     )
+    print(f"Route: {getattr(config, 'training_route', 'proto_no_view_align')}")
     print(
         "Stage1: "
-        "mode=full_recon+local_window_APN | "
+        "mode=full_recon+local_window_anchor | "
         f"context_len={getattr(config, 'stage1_inject_context_len', 0) or getattr(config, 'seq_len', 20)} | "
         "positive=X_t_minus_1 | "
-        "geometry=small_margin_AP_hinge | "
-        f"lambda_triplet={getattr(config, 'lambda_stage1_triplet', 1.0)} | "
-        f"ap_margin={getattr(config, 'stage1_ap_margin', 0.1)} | "
+        "geometry=raw_latent_local_pos+local_neg | "
+        "detach=off | "
+        "normalize=off | "
+        "prototype=off | "
+        f"lambda_local={getattr(config, 'lambda_stage1_local', 1.0)} | "
+        f"pos_margin={getattr(config, 'stage1_pos_margin', 0.1)} | "
         "lambda_cv=off | "
-        f"triplet_margin={getattr(config, 'stage1_triplet_margin', 0.3)}"
+        f"neg_margin={getattr(config, 'stage1_neg_margin', 0.3)}"
     )
     print(
         "Stage2: "
@@ -303,7 +340,9 @@ def print_train_summary(config: Config, run_dir: str, run_name: str, experiment_
         f"ap={getattr(config, 'lambda_ap_B', 0.2)}, "
         f"core={getattr(config, 'lambda_core_B', 0.5)}, "
         f"neg={getattr(config, 'lambda_neg_B', 0.05)}, "
-        f"boundary_q={getattr(config, 'boundary_quantile', 0.95)}) | "
+        f"boundary_q={getattr(config, 'boundary_quantile', 0.95)}, "
+        f"neg_boundary_margin={getattr(config, 'negative_boundary_margin', 0.1)}, "
+        f"radius_refresh={getattr(config, 'stage2_radius_refresh_mode', 'b_epoch')}) | "
         f"threshold_q={config.decision_quantile}"
     )
     print(
@@ -338,11 +377,13 @@ def print_eval_summary(
         f"in_channels={config.in_channels} | "
         f"active_view={getattr(config, 'active_view', 'v1')} | "
         f"dual_feature={getattr(config, 'dual_view_feature_mode', 'avg')} | "
+        f"dual_encoder={getattr(config, 'dual_encoder_type', 'axis')} | "
         f"{_encoder_config_summary(config)} | "
         f"{_encoder_backbone_summary(config)}"
     )
     print(
         "Evaluation: "
+        f"route={getattr(config, 'training_route', 'proto_no_view_align')} | "
         f"method={getattr(config, 'stage2_method', 'separate_proto')} | "
         f"num_prototypes={getattr(config, 'num_prototypes', 0)} | "
         f"threshold_q={config.decision_quantile}"
@@ -392,7 +433,7 @@ def run_training(
                 for key, value in metrics.items():
                     print(f"{key}: {value:.6f}")
             else:
-                print("No fused anomaly score emitted; reporting component score families only.")
+                print("No primary anomaly score emitted; reporting component score families only.")
             print_score_family_results(results)
             print(f"\nRun artifacts saved under: {os.path.abspath(run_dir)}")
 
@@ -442,7 +483,7 @@ def run_evaluation(
                 for key, value in metrics.items():
                     print(f"{key}: {value:.6f}")
             else:
-                print("No fused anomaly score emitted; reporting component score families only.")
+                print("No primary anomaly score emitted; reporting component score families only.")
             print_score_family_results(results)
             print(f"\nEval artifacts saved under: {os.path.abspath(run_dir)}")
 

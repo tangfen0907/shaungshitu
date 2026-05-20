@@ -41,8 +41,11 @@ def build_common_preset_overrides(
     for key in (
         "active_view",
         "dual_view_feature_mode",
+        "dual_encoder_type",
+        "training_route",
         "scaler_fit_mode",
         "stage2_method",
+        "stage2_radius_refresh_mode",
         "tcn_activation",
         "test_split_mode",
         "train_split_mode",
@@ -99,6 +102,8 @@ TRAIN_OVERRIDE_KEYS = [
     "use_attentive_pooling",
     "active_view",
     "dual_view_feature_mode",
+    "dual_encoder_type",
+    "training_route",
     "stage2_method",
     "state_dim",
     "num_prototypes",
@@ -123,9 +128,9 @@ TRAIN_OVERRIDE_KEYS = [
     "cudnn_benchmark",
     "stage1_positive_offset",
     "stage1_inject_context_len",
-    "lambda_stage1_triplet",
-    "stage1_ap_margin",
-    "stage1_triplet_margin",
+    "lambda_stage1_local",
+    "stage1_pos_margin",
+    "stage1_neg_margin",
     "num_stage2_rounds",
     "stage2_a_epochs",
     "stage2_b_epochs",
@@ -143,6 +148,7 @@ TRAIN_OVERRIDE_KEYS = [
     "boundary_quantile",
     "negative_boundary_margin",
     "use_negative_boundary_radius",
+    "stage2_radius_refresh_mode",
     "decision_quantile",
     "enable_stage_visualization",
     "enable_stage1_recon_scoring",
@@ -192,6 +198,13 @@ def build_parser(
         choices=["v1", "v2_flatten", "dual"],
     )
     parser.add_argument("--dual_view_feature_mode", type=str, default=None, choices=["avg", "v1", "v2"])
+    parser.add_argument("--dual_encoder_type", type=str, default=None, choices=["axis", "tcn"])
+    parser.add_argument(
+        "--training_route",
+        type=str,
+        default=None,
+        choices=["proto_no_view_align"],
+    )
     parser.add_argument(
         "--stage2_method",
         type=str,
@@ -223,9 +236,9 @@ def build_parser(
 
     parser.add_argument("--stage1_positive_offset", type=int, default=None)
     parser.add_argument("--stage1_inject_context_len", type=int, default=None)
-    parser.add_argument("--lambda_stage1_triplet", type=float, default=None)
-    parser.add_argument("--stage1_ap_margin", type=float, default=None)
-    parser.add_argument("--stage1_triplet_margin", type=float, default=None)
+    parser.add_argument("--lambda_stage1_local", type=float, default=None)
+    parser.add_argument("--stage1_pos_margin", type=float, default=None)
+    parser.add_argument("--stage1_neg_margin", type=float, default=None)
 
     parser.add_argument("--num_stage2_rounds", type=int, default=None)
     parser.add_argument("--stage2_a_epochs", type=int, default=None)
@@ -244,6 +257,16 @@ def build_parser(
     parser.add_argument("--boundary_quantile", type=float, default=None)
     parser.add_argument("--negative_boundary_margin", type=float, default=None)
     parser.add_argument("--use_negative_boundary_radius", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument(
+        "--stage2_radius_refresh_mode",
+        type=str,
+        default=None,
+        choices=["b_epoch", "round"],
+        help=(
+            "When to refresh Stage2 prototype boundary radii. "
+            "'b_epoch' preserves the current behavior; 'round' refreshes once after each A block."
+        ),
+    )
     parser.add_argument("--decision_quantile", type=float, default=None)
 
     parser.add_argument("--enable_stage_visualization", action=argparse.BooleanOptionalAction, default=None)

@@ -11,6 +11,75 @@ from model.svdd_head import MultiCenterSVDD
 from model.tcn_encoder import TCNEncoder
 
 
+class DualTCNEncoder(nn.Module):
+    """Dual-view wrapper that keeps the separate-prototype route but uses TCNs.
+
+    View1 is the ordinary channel-first local window [B, M, L].
+    View2 follows the legacy flattened view [B, 1, L*M].
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        history_len: int,
+        d_model: int,
+        tcn_layers,
+        tcn_kernel_size: int = 3,
+        v2_first_kernel_size: int = 0,
+        dropout: float = 0.1,
+        activation: str = "relu",
+        use_attentive_pooling: bool = False,
+    ):
+        super().__init__()
+        self.in_channels = int(in_channels)
+        self.history_len = int(history_len)
+        self.flat_len = int(in_channels) * int(history_len)
+        layers = tuple(tcn_layers)
+        self.encoder_v1 = TCNEncoder(
+            in_channels=self.in_channels,
+            latent_dim=d_model,
+            tcn_layers=layers,
+            kernel_size=tuple(int(tcn_kernel_size) for _ in layers),
+            dropout=dropout,
+            activation=activation,
+            use_attentive_pooling=use_attentive_pooling,
+            dilations=tuple(2 ** idx for idx, _ in enumerate(layers)),
+        )
+        first_kernel_size = int(v2_first_kernel_size) if int(v2_first_kernel_size) > 0 else int(tcn_kernel_size)
+        self.encoder_v2 = TCNEncoder(
+            in_channels=1,
+            latent_dim=d_model,
+            tcn_layers=layers,
+            kernel_size=tuple(
+                first_kernel_size if idx == 0 else int(tcn_kernel_size)
+                for idx, _ in enumerate(layers)
+            ),
+            dropout=dropout,
+            activation=activation,
+            use_attentive_pooling=use_attentive_pooling,
+            dilations=tuple(1 if idx == 0 else self.in_channels * (2 ** (idx - 1)) for idx, _ in enumerate(layers)),
+        )
+
+    def forward(self, x: torch.Tensor) -> dict:
+        if x.dim() != 3:
+            raise ValueError(f"DualTCNEncoder expects [B, M, L], got {tuple(x.shape)}")
+        if x.size(1) != self.in_channels or x.size(2) != self.history_len:
+            raise ValueError(
+                f"DualTCNEncoder expected [B,{self.in_channels},{self.history_len}], got {tuple(x.shape)}"
+            )
+        batch_size = int(x.size(0))
+        x_flat = x.transpose(1, 2).contiguous().reshape(batch_size, 1, self.flat_len)
+        h1 = self.encoder_v1(x)
+        h2 = self.encoder_v2(x_flat)
+        return {
+            "F1": h1,
+            "H1": h1,
+            "x_flat": x_flat.transpose(1, 2).contiguous(),
+            "F2": h2,
+            "H2": h2,
+        }
+
+
 class AnomalyDetector(nn.Module):
     """Top-level anomaly detector.
 
@@ -36,6 +105,7 @@ class AnomalyDetector(nn.Module):
         use_attentive_pooling: bool = False,
         active_view: str = "v1",
         dual_view_feature_mode: str = "avg",
+        dual_encoder_type: str = "axis",
         state_dim: int = 0,
         num_prototypes: int = 1,
         proto_temperature: float = 0.2,
@@ -47,6 +117,7 @@ class AnomalyDetector(nn.Module):
         self.raw_seq_len = int(seq_len)
         self.active_view = self._normalize_active_view(active_view)
         self.dual_view_feature_mode = self._normalize_dual_feature_mode(dual_view_feature_mode)
+        self.dual_encoder_type = self._normalize_dual_encoder_type(dual_encoder_type)
         self.is_dual_view = self.active_view == "dual"
         self.tcn_kernel_size = int(tcn_kernel_size)
         self.v2_first_kernel_size = int(v2_first_kernel_size)
@@ -63,13 +134,26 @@ class AnomalyDetector(nn.Module):
         if self.is_dual_view:
             self.encoder_in_channels = self.raw_in_channels
             self.encoder_seq_len = self.raw_seq_len
-            self.dual_encoder = PointwiseDualEncoder(
-                in_channels=self.raw_in_channels,
-                d_model=latent_dim,
-                history_len=self.raw_seq_len,
-                dropout=dropout,
-                activation=tcn_activation,
-            )
+            if self.dual_encoder_type == "tcn":
+                self.dual_encoder = DualTCNEncoder(
+                    in_channels=self.raw_in_channels,
+                    history_len=self.raw_seq_len,
+                    d_model=latent_dim,
+                    tcn_layers=tcn_layers,
+                    tcn_kernel_size=tcn_kernel_size,
+                    v2_first_kernel_size=v2_first_kernel_size,
+                    dropout=dropout,
+                    activation=tcn_activation,
+                    use_attentive_pooling=use_attentive_pooling,
+                )
+            else:
+                self.dual_encoder = PointwiseDualEncoder(
+                    in_channels=self.raw_in_channels,
+                    d_model=latent_dim,
+                    history_len=self.raw_seq_len,
+                    dropout=dropout,
+                    activation=tcn_activation,
+                )
             self.encoder_v2_in_channels = self.raw_in_channels
             self.encoder_v2_seq_len = self.raw_seq_len
             self.reconstructor_v1 = Reconstructor(
@@ -237,6 +321,23 @@ class AnomalyDetector(nn.Module):
         key = aliases.get(key, key)
         if key not in {"avg", "v1", "v2"}:
             raise ValueError("dual_view_feature_mode should be one of: avg, v1, v2.")
+        return key
+
+    @staticmethod
+    def _normalize_dual_encoder_type(encoder_type: str) -> str:
+        key = str(encoder_type or "axis").strip().lower()
+        aliases = {
+            "pointwise": "axis",
+            "local_window": "axis",
+            "local-window": "axis",
+            "axis_view": "axis",
+            "axis-view": "axis",
+            "dual_tcn": "tcn",
+            "tcns": "tcn",
+        }
+        key = aliases.get(key, key)
+        if key not in {"axis", "tcn"}:
+            raise ValueError("dual_encoder_type should be 'axis' or 'tcn'.")
         return key
 
     def _view_encoder_shape(self, view: str) -> tuple:

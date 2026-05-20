@@ -243,6 +243,12 @@ def save_result_artifacts(run_dir: str, results: dict):
         "proto_pred2.npy": banks.get("proto_pred2"),
         "proto_dist1.npy": banks.get("proto_dist1"),
         "proto_dist2.npy": banks.get("proto_dist2"),
+        "cluster_radii_v1.npy": banks.get("cluster_radii_v1"),
+        "cluster_radii_v2.npy": banks.get("cluster_radii_v2"),
+        "local_radius_v1.npy": banks.get("local_radius_v1"),
+        "local_radius_v2.npy": banks.get("local_radius_v2"),
+        "local_dist_v1.npy": banks.get("local_dist_v1"),
+        "local_dist_v2.npy": banks.get("local_dist_v2"),
         "proto_recon1.npy": banks.get("recon1"),
         "proto_recon2.npy": banks.get("recon2"),
     }

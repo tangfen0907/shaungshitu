@@ -9,7 +9,7 @@ from torch.optim import Adam
 from torch.utils.data import DataLoader
 
 from data_factory.data_loader import get_loader_segment
-from data_factory.triplet_dataset import _extract_window
+from data_factory.local_window_dataset import _extract_window
 from model.main_net import AnomalyDetector
 from trainer import active_pool as active_pool_methods
 from trainer import evaluator as evaluator_methods
@@ -125,6 +125,7 @@ class Solver:
             use_attentive_pooling=self.config.use_attentive_pooling,
             active_view=getattr(self.config, "active_view", "v1"),
             dual_view_feature_mode=getattr(self.config, "dual_view_feature_mode", "avg"),
+            dual_encoder_type=getattr(self.config, "dual_encoder_type", "axis"),
             state_dim=int(getattr(self.config, "state_dim", 0)),
             num_prototypes=int(
                 getattr(self.config, "num_prototypes", 0)
@@ -536,18 +537,6 @@ class Solver:
                 return torch.zeros((), device=self.device)
             return torch.zeros((), device=reference.device, dtype=reference.dtype)
         return torch.mean((outputs["z1"] - outputs["z2"]) ** 2)
-
-    def _stage1_triplet_embedding_loss(
-        self,
-        z_anchor: torch.Tensor,
-        z_positive: torch.Tensor,
-        z_negative: torch.Tensor,
-    ) -> torch.Tensor:
-        d_ap = torch.sqrt(torch.sum((z_anchor - z_positive) ** 2, dim=1) + 1e-12)
-        d_an = torch.sqrt(torch.sum((z_anchor - z_negative) ** 2, dim=1) + 1e-12)
-        ap_margin = float(getattr(self.config, "stage1_ap_margin", 0.1))
-        margin = float(getattr(self.config, "stage1_triplet_margin", 0.3))
-        return (torch.relu(d_ap - ap_margin) ** 2 + torch.relu(margin - d_an) ** 2).mean()
 
     def _is_dual_view_model(self) -> bool:
         return bool(getattr(self.model, "is_dual_view", False))
